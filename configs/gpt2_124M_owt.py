@@ -38,8 +38,8 @@ training = TrainingConfig(
     # 数据
     dataset="openwebtext",
     data_dir="data/openwebtext",
-    batch_size=12,               # 每 GPU micro-batch 大小
-    gradient_accumulation_steps=40,  # 总累积: 12*40*8*1024 ≈ 0.5M tokens/step
+    batch_size=12,              # 每 GPU micro-batch（增大可减少循环次数 → 更快）
+    gradient_accumulation_steps=40,  # 40×12×4GPU×1024 ≈ 0.5M tokens/step
     # 优化器 (AdamW)
     learning_rate=6e-4,
     weight_decay=1e-1,
@@ -59,7 +59,7 @@ training = TrainingConfig(
     # 系统
     backend="ddp",               # 多卡 DDP
     device="cuda",
-    dtype="bfloat16",
+    dtype="float16",
     compile=True,
     # DDP
     ddp_backend="nccl",

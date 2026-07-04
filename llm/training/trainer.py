@@ -23,6 +23,8 @@ from llm.config.model_config import GPTConfig
 from llm.config.training_config import TrainingConfig
 from llm.training.backends import TrainingBackend
 from llm.training.scheduler import WarmupCosineSchedule, ConstantSchedule
+from llm.training.graceful import GracefulStopper
+from llm.training.logger import TrainingLogger
 
 
 class Trainer:
@@ -46,11 +48,22 @@ class Trainer:
         model: nn.Module,
         config: TrainingConfig,
         backend: TrainingBackend,
-        data_provider=None,  # 见 llm/data/dataset.py
+        data_provider=None,  # DataProvider | dict[str, CyclingDataLoader]
     ):
         self.config = config
         self.backend = backend
-        self.data = data_provider
+        # 兼容新旧两种数据接口
+        if isinstance(data_provider, dict):
+            # 新接口: DataLoader → 创建持久迭代器
+            self._train_iter = iter(data_provider['train'])
+            self._val_iter = iter(data_provider['val'])
+            self._loaders = data_provider
+            self.data = None
+        else:
+            self._train_iter = None
+            self._val_iter = None
+            self._loaders = None
+            self.data = data_provider                     # 旧 DataProvider 接口
 
         # ── 模型准备（设备放置 + 分布式包装）──
         self.raw_model = model  # 保持原始引用（checkpoint 保存用）
@@ -89,7 +102,11 @@ class Trainer:
         self.running_mfu = -1.0
         self._last_loss = 0.0
 
+        # ── 优雅退出 ──
+        self.stopper = GracefulStopper(config.out_dir)
+
         # ── 日志 ──
+        self.logger = TrainingLogger(config, backend, self.raw_model) if backend.is_master else None
         self.wandb = None
         if config.wandb_log and backend.is_master:
             try:
@@ -119,6 +136,10 @@ class Trainer:
         config = self.config
         backend = self.backend
 
+        # 启动 GPU 监控
+        if self.logger is not None:
+            self.logger.start_gpu_monitor()
+
         # 预取第一个 batch
         X, Y = self._get_batch('train')
         t0 = time.time()
@@ -138,21 +159,43 @@ class Trainer:
                 break
 
             # ── 3. 梯度累积循环 ──
+            micro_step = 0
+            loss_val = None  # 防止循环体未执行时未定义
             for micro_step in range(config.gradient_accumulation_steps):
                 is_last = (micro_step == config.gradient_accumulation_steps - 1)
+
+                # 检查退出信号（Ctrl-C 可能在微批次循环中触发）
+                if self.stopper.should_stop():
+                    break
 
                 with backend.autocast_context():
                     logits, loss = self.model(X, Y)
                     loss = loss / config.gradient_accumulation_steps
 
-                # 记录最后一个 micro_step 的 loss（用于日志打印）
-                self._last_loss = loss.item()
+                # detach 保存 loss 值（不触发 GPU 同步，异步流水线不被打断）
+                loss_val = loss.detach()
 
-                # 异步预取下一 batch（在 GPU 忙于 backward 时加载数据）
-                X, Y = self._get_batch('train')
+                # 异步预取下一 batch（与 GPU backward 并行）
+                try:
+                    X, Y = self._get_batch('train')
+                except RuntimeError as e:
+                    if "DataLoader worker" in str(e):
+                        print(f"\n[WARNING] DataLoader worker 异常退出，可能是 Ctrl-C")
+                        self.stopper._stop_requested = True
+                        break
+                    raise
 
                 # 反向传播（DDP: 非最后步通过 model.no_sync() 跳过 all-reduce）
                 backend.backward(self.model, loss, is_last_micro_step=is_last)
+
+            # 整个梯度累积完成后才同步取 loss（只 sync 一次）
+            self._last_loss = loss_val.item() if loss_val is not None else 0.0
+
+            # 微批次循环提前退出 → 梯度不完整 → 跳过参数更新
+            if micro_step < config.gradient_accumulation_steps - 1:
+                if not self.stopper._stop_requested:
+                    self._last_loss = 0.0
+                continue  # 回到 while True 开头，触发终止条件退出
 
             # ── 4. 梯度裁剪 → 更新参数 → 清零 ──
             if config.grad_clip > 0.0:
@@ -174,10 +217,22 @@ class Trainer:
             self.iter_num += 1
 
             # ── 终止条件 ──
-            if self.iter_num > config.max_iters:
+            if self.iter_num > config.max_iters or self.stopper.should_stop():
+                if self.stopper._stop_requested:
+                    if backend.is_master:
+                        self._save_checkpoint()
+                    # 非 master 等一等 master 保存完
+                    if backend.world_size > 1:
+                        import torch.distributed as dist
+                        dist.barrier()
+                    if backend.is_master:
+                        print(f"[INFO] 优雅退出，checkpoint 已保存 (iter {self.iter_num})")
                 break
 
         backend.cleanup()
+        self.stopper.cleanup()
+        if self.logger is not None:
+            self.logger.stop_gpu_monitor()
 
     # ═══════════════════════════════════════════════════════════════════
     # 评估 & Checkpoint
@@ -192,6 +247,13 @@ class Trainer:
         losses = self._estimate_loss()
         print(f"step {self.iter_num}: train loss {losses['train']:.4f}, "
               f"val loss {losses['val']:.4f}")
+
+        # 写入状态文件
+        if self.logger is not None:
+            lr = self.scheduler(self.iter_num)
+            self.logger.write_status_file(
+                self.iter_num, losses['train'], lr, self.best_val_loss
+            )
 
         # Wandb 日志
         if self.wandb is not None:
@@ -224,7 +286,7 @@ class Trainer:
                 with backend.autocast_context():
                     _, loss = self.model(X, Y)
                 losses[k] = loss.item()
-            out[split] = losses.mean()
+            out[split] = losses.mean().item()
         self.model.train()
         return out
 
@@ -280,53 +342,55 @@ class Trainer:
     # ═══════════════════════════════════════════════════════════════════
 
     def _log(self, dt: float):
-        """打印一步的训练指标。"""
-        config = self.config
+        """打印一步的训练指标（委托给 TrainingLogger）。"""
+        lossf = self._last_loss * self.config.gradient_accumulation_steps
+        lr = self.scheduler(self.iter_num)
 
-        # 计算 MFU（跳过前几步让训练稳定）
-        if self.iter_num >= 5:
-            fwdbwd_per_iter = (
-                config.gradient_accumulation_steps
-                * config.batch_size
-                * self.raw_model.config.block_size
-                * self.backend.world_size
-            )
-            mfu = self.raw_model.estimate_mfu(fwdbwd_per_iter, dt)
-            self.running_mfu = (
-                mfu
-                if self.running_mfu == -1.0
-                else 0.9 * self.running_mfu + 0.1 * mfu
-            )
+        # 计算 MFU
+        if self.iter_num >= 5 and self.logger is not None:
+            mfu = self.logger.compute_mfu(dt)
+            self.running_mfu = mfu
+        else:
+            self.running_mfu = -1.0
 
-        lossf = self._last_loss * config.gradient_accumulation_steps
-        print(
-            f"iter {self.iter_num}: loss {lossf:.4f}, "
-            f"time {dt*1000:.2f}ms, mfu {self.running_mfu*100:.2f}%"
-        )
+        if self.logger is not None:
+            self.logger.log_step(self.iter_num, lossf, dt, lr,
+                                 max(self.running_mfu, 0.0))
+            # 每 10 步更新一次状态文件
+            if self.iter_num % 10 == 0:
+                self.logger.write_status_file(
+                    self.iter_num, lossf, lr, self.best_val_loss
+                )
 
     # ═══════════════════════════════════════════════════════════════════
     # 数据获取
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_batch(self, split: str):
-        """从 DataProvider 获取一个 batch，并移动到正确设备。
+        """获取一个 batch 并异步传输到 GPU。
 
-        如果还没有 data_provider，则回退到内存映射方式（兼容 nanoGPT 的 .bin 文件）。
+        数据源:
+        - DataLoader + IterableDataset: 已 pin_memory，直接 .to(device, non_blocking)
+        - DataProvider (旧接口): 手动 pin_memory + 传输
         """
-        if self.data is not None:
+        device = self.backend.device
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+
+        if self._train_iter is not None:
+            # 新接口: DataLoader 持久迭代器（pin_memory 已由 DataLoader 处理）
+            it = self._train_iter if split == 'train' else self._val_iter
+            X, Y = next(it)
+        elif self.data is not None:
+            # 旧接口: DataProvider
             X, Y = self.data.get_batch(split)
+        else:
+            raise RuntimeError(
+                "No data source set. Pass data_provider or loaders dict to Trainer."
+            )
 
-            # 移动到设备 + 锁页内存（异步传输）
-            device_type = 'cuda' if self.backend.device.type == 'cuda' else 'cpu'
-            if device_type == 'cuda':
-                X = X.pin_memory().to(self.backend.device, non_blocking=True)
-                Y = Y.pin_memory().to(self.backend.device, non_blocking=True)
-            else:
-                X, Y = X.to(self.backend.device), Y.to(self.backend.device)
-            return X, Y
-
-        # 回退: 如果没有注入 data_provider，需要子类覆盖此方法
-        raise RuntimeError(
-            "No data_provider set. Either pass one to Trainer.__init__ "
-            "or override _get_batch()."
-        )
+        if device_type == 'cuda':
+            X = X.to(device, non_blocking=True)
+            Y = Y.to(device, non_blocking=True)
+        else:
+            X, Y = X.to(device), Y.to(device)
+        return X, Y

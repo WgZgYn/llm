@@ -8,6 +8,8 @@ from .backends import (
 )
 from .scheduler import WarmupCosineSchedule, ConstantSchedule
 from .trainer import Trainer
+from .graceful import GracefulStopper
+from .logger import TrainingLogger
 
 __all__ = [
     "TrainingBackend",
@@ -19,4 +21,6 @@ __all__ = [
     "WarmupCosineSchedule",
     "ConstantSchedule",
     "Trainer",
+    "GracefulStopper",
+    "TrainingLogger",
 ]

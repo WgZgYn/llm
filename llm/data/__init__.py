@@ -6,6 +6,7 @@ from .dataset import (
     AdditionDataset,
     collate_addition_batch,
 )
+from .loader import create_dataloader
 
 __all__ = [
     "DataProvider",
@@ -14,4 +15,5 @@ __all__ = [
     "CharTokenizer",
     "AdditionDataset",
     "collate_addition_batch",
+    "create_dataloader",
 ]

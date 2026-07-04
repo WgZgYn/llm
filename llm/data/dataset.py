@@ -55,18 +55,27 @@ class MemMapDataProvider(DataProvider):
     数据格式: 连续的 uint16 token ids，train.bin + val.bin。
     每次 get_batch 随机采样 block_size 长度的片段。
 
+    DDP 数据分片: 传入 rank/world_size 后，每 GPU 仅从自己分片内采样，
+    避免多进程争抢同一文件。
+
     用法:
-        data = MemMapDataProvider("data/shakespeare_char", batch_size=12, block_size=1024)
+        data = MemMapDataProvider("data/shakespeare_char", batch_size=12,
+                                  block_size=1024, rank=0, world_size=4)
         X, Y = data.get_batch("train")  # 返回 CPU tensor
     """
 
-    def __init__(self, data_dir: str, batch_size: int, block_size: int):
+    def __init__(self, data_dir: str, batch_size: int, block_size: int,
+                 rank: int = 0, world_size: int = 1):
+        import pickle
+        import warnings
+
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.block_size = block_size
+        self._rank = rank
+        self._world_size = world_size
 
         # 从 meta.pkl 读取 vocab_size
-        import pickle
         meta_path = os.path.join(data_dir, 'meta.pkl')
         if os.path.exists(meta_path):
             with open(meta_path, 'rb') as f:
@@ -74,32 +83,60 @@ class MemMapDataProvider(DataProvider):
             self._vocab_size = meta['vocab_size']
             print(f"found vocab_size = {self._vocab_size} (inside {meta_path})")
         else:
-            # 回退: 从 .bin 文件的 dtype 推断
             print(f"no meta.pkl found, defaulting vocab_size to 50304")
             self._vocab_size = 50304
+
+        # ── 缓存 memmap（只 open 一次，不复读）──
+        self._cached_data: dict[str, np.memmap] = {}
+        self._cached_tensor: dict[str, torch.Tensor] = {}  # torch view（零拷贝）
+        self._shard_ranges: dict[str, tuple[int, int]] = {}
+
+        for split_name, filename in [('train', 'train.bin'), ('val', 'val.bin')]:
+            filepath = os.path.join(data_dir, filename)
+            if os.path.exists(filepath):
+                mmap = np.memmap(filepath, dtype=np.uint16, mode='r')
+                self._cached_data[split_name] = mmap
+                # torch.from_numpy(mmap) 共享 mmap 底层 buffer，零拷贝
+                # mmap mode='r' 只读，但我们只读取不写入，抑制 writable 警告
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore",
+                        message=".*non-writable.*")
+                    self._cached_tensor[split_name] = torch.from_numpy(mmap)
+
+                # DDP 数据分片：每 GPU 有独立的采样区间
+                total = len(mmap)
+                if split_name == 'train' and world_size > 1:
+                    shard_size = total // world_size
+                    start = rank * shard_size
+                    end = (rank + 1) * shard_size if rank < world_size - 1 else total
+                else:
+                    start, end = 0, total
+                self._shard_ranges[split_name] = (start, end)
 
     @property
     def vocab_size(self) -> int:
         return self._vocab_size
 
     def get_batch(self, split: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """随机采样一个 batch。每次重新 mmap 以避免内存泄漏。"""
-        # 每次重新创建 memmap 以避免累积内存占用
-        # 参见: https://stackoverflow.com/questions/45132940
-        filepath = os.path.join(self.data_dir, f'{split}.bin')
-        data = np.memmap(filepath, dtype=np.uint16, mode='r')
+        """随机采样一个 batch（torch 索引，一次调用完成）。
 
-        # 随机采样起始位置
-        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
+        使用 torch.from_numpy(mmap) 的零拷贝视图 → torch 高级索引 → .long()，
+        避免 numpy list comprehension 的逐条拷贝开销。
+        """
+        raw = self._cached_tensor[split]                  # torch view（零拷贝）
+        shard_start, shard_end = self._shard_ranges[split]
 
-        x = torch.stack([
-            torch.from_numpy((data[i:i + self.block_size]).astype(np.int64))
-            for i in ix
-        ])
-        y = torch.stack([
-            torch.from_numpy((data[i + 1:i + 1 + self.block_size]).astype(np.int64))
-            for i in ix
-        ])
+        max_start = shard_end - self.block_size - 1
+        starts = torch.randint(shard_start, max_start, (self.batch_size,))
+
+        # 向量化索引: [B] → [B, T]
+        offsets = torch.arange(self.block_size, dtype=torch.long)
+        idx_x = starts.unsqueeze(1) + offsets.unsqueeze(0)       # [B, T]
+        idx_y = idx_x + 1                                        # [B, T] 右移一位
+
+        # torch 高级索引 → .long() 转换 dtype（仅复制 [B,T] 切片，非全量）
+        x = raw[idx_x].long()
+        y = raw[idx_y].long()
 
         return x, y  # CPU tensor; Trainer 负责移动
 

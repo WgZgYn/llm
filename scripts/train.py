@@ -18,7 +18,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from llm import GPT, GPTConfig, TrainingConfig, Trainer, create_backend, validate_configs
-from llm.data import MemMapDataProvider
+from llm.data.loader import create_dataloader
 
 
 def load_config(config_path: str) -> tuple[GPTConfig, TrainingConfig]:
@@ -133,17 +133,27 @@ def main():
     backend = create_backend(train_cfg)
     print(f"Backend: {type(backend).__name__}, device: {backend.device}")
 
-    # ── 7. 创建数据 ──
+    # ── 7. 创建数据（IterableDataset 天然无限，无需 CyclingDataLoader）──
     data_dir = train_cfg.data_dir or os.path.join(PROJECT_ROOT, "data", train_cfg.dataset)
     if os.path.exists(os.path.join(data_dir, "train.bin")):
-        data = MemMapDataProvider(data_dir, train_cfg.batch_size, model_cfg.block_size)
+        train_loader = create_dataloader(
+            data_dir, "train",
+            batch_size=train_cfg.batch_size,
+            block_size=model_cfg.block_size,
+        )
+        val_loader = create_dataloader(
+            data_dir, "val",
+            batch_size=train_cfg.batch_size,
+            block_size=model_cfg.block_size,
+        )
+        loaders = {"train": train_loader, "val": val_loader}
     else:
         print(f"[ERROR] 未找到训练数据: {data_dir}/train.bin")
         print(f"请先运行数据预处理脚本，如: python llm/data/prepare/{train_cfg.dataset}.py")
         sys.exit(1)
 
     # ── 8. 创建 Trainer 并启动 ──
-    trainer = Trainer(model, train_cfg, backend, data_provider=data)
+    trainer = Trainer(model, train_cfg, backend, data_provider=loaders)
 
     if train_cfg.init_from == "resume":
         trainer.load_checkpoint()
