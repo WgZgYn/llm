@@ -1,27 +1,20 @@
-"""Trainer —— 后端无关的训练循环编排器。
+"""Trainer —— 极简训练循环编排器。
 
-所有分布式/混合精度逻辑通过 TrainingBackend 抽象，
-Trainer 只关心训练流程本身：数据 → 前向 → 反向 → 更新 → 评估 → 保存。
+不做的事（全部交给 PyTorch 和 train.py）:
+    - 不包装 DDP/FSDP/DeepSpeed
+    - 不创建 optimizer / scaler / scheduler
+    - 不做数据分片
 
-用法:
-    from llm import GPT, GPTConfig, TrainingConfig, Trainer, create_backend
-
-    config = TrainingConfig(max_iters=100, dataset="shakespeare_char")
-    model_config = GPTConfig.from_preset("gpt2")
-    model = GPT(model_config)
-    backend = create_backend(config)
-    trainer = Trainer(model, config, backend)
-    trainer.train()
+Trainer 只负责: 拿数据 → 前向 → 反向 → 更新 → 评估 → 日志 → checkpoint。
 """
 
 import os
 import time
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
-from llm.config.model_config import GPTConfig
 from llm.config.training_config import TrainingConfig
-from llm.training.backends import TrainingBackend
 from llm.training.scheduler import WarmupCosineSchedule, ConstantSchedule
 from llm.training.graceful import GracefulStopper
 from llm.training.logger import TrainingLogger
@@ -30,367 +23,294 @@ from llm.training.logger import TrainingLogger
 class Trainer:
     """训练编排器。
 
-    职责:
-    - 编排训练循环（数据 → 前向 → 反向 → 更新）
-    - LR 调度
-    - 评估 + checkpoint 保存/恢复
-    - 日志（文本 + 可选 wandb）
-    - MFU 估算
+    所有并行策略（DDP/FSDP/DeepSpeed）由 train.py 在外部设置好，
+    Trainer 不感知具体后端，只运行标准训练循环。
 
-    不负责（由 Backend 处理）:
-    - 设备放置
-    - 混合精度策略
-    - 分布式通信
+    参数:
+        model:       已包装好（DDP/FSDP/DeepSpeed）或裸模型
+        optimizer:   AdamW 等优化器
+        config:      TrainingConfig
+        train_loader: DataLoader（已 pin_memory）
+        val_loader:   DataLoader
+        raw_model:   DDP 包装前的原始模型（checkpoint 保存用，None=同 model）
+        scaler:      GradScaler（fp16 时传入，bf16/fp32 时 None）
+        ddp:         True 表示 model 是 DDP 包装（需 no_sync 控制梯度同步）
     """
 
     def __init__(
         self,
         model: nn.Module,
+        optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        backend: TrainingBackend,
-        data_provider=None,  # DataProvider | dict[str, CyclingDataLoader]
+        train_loader,
+        val_loader,
+        raw_model: nn.Module | None = None,
+        scaler: torch.amp.GradScaler | None = None,
+        ddp: bool = False,
     ):
         self.config = config
-        self.backend = backend
-        # 兼容新旧两种数据接口
-        if isinstance(data_provider, dict):
-            # 新接口: DataLoader → 创建持久迭代器
-            self._train_iter = iter(data_provider['train'])
-            self._val_iter = iter(data_provider['val'])
-            self._loaders = data_provider
-            self.data = None
-        else:
-            self._train_iter = None
-            self._val_iter = None
-            self._loaders = None
-            self.data = data_provider                     # 旧 DataProvider 接口
+        self.model = model
+        self.optimizer = optimizer
+        self.raw_model = raw_model or model
+        self.scaler = scaler
+        self.ddp = ddp
 
-        # ── 模型准备（设备放置 + 分布式包装）──
-        self.raw_model = model  # 保持原始引用（checkpoint 保存用）
-        self.model = backend.prepare_model(model)
+        # 持久迭代器
+        self._train_iter = iter(train_loader)
+        self._val_iter = iter(val_loader)
 
-        # ── torch.compile ──
-        if config.compile and hasattr(torch, 'compile'):
-            try:
-                import triton  # noqa: F401 — torch.compile 的 inductor 后端依赖 Triton
-            except ImportError:
-                print("[WARNING] Triton not available (e.g. on Windows), "
-                      "skipping torch.compile. Install via: pip install triton")
-            else:
-                print("compiling the model... (takes ~a minute)")
-                self.model = torch.compile(self.model)
-
-        # ── 优化器 ──
-        self.optimizer = backend.prepare_optimizer(
-            self.model, config  # 传入 wrapped model
-        )
-
-        # ── LR 调度器 ──
+        # LR 调度
         if config.decay_lr:
             self.scheduler = WarmupCosineSchedule(
-                lr_max=config.learning_rate,
-                lr_min=config.min_lr,
+                lr_max=config.learning_rate, lr_min=config.min_lr,
                 warmup_iters=config.warmup_iters,
                 total_iters=config.lr_decay_iters,
             )
         else:
             self.scheduler = ConstantSchedule(config.learning_rate)
 
-        # ── 训练状态 ──
+        # 训练状态
         self.iter_num = 0
         self.best_val_loss = float('inf')
-        self.running_mfu = -1.0
         self._last_loss = 0.0
 
-        # ── 优雅退出 ──
+        # 优雅退出
         self.stopper = GracefulStopper(config.out_dir)
 
-        # ── 日志 ──
-        self.logger = TrainingLogger(config, backend, self.raw_model) if backend.is_master else None
-        self.wandb = None
-        if config.wandb_log and backend.is_master:
-            try:
-                import wandb
-                self.wandb = wandb
-                self.wandb.init(
-                    project=config.wandb_project,
-                    name=config.wandb_run_name or f"run_{int(time.time())}",
-                    config=config.to_dict(),
-                )
-            except ImportError:
-                print("[WARNING] wandb not installed, skipping logging")
+        # 日志（仅 rank 0）
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.logger = (TrainingLogger(config, self._device_str, self._gpu_name,
+                                      self.raw_model, self._world_size,
+                                      config.out_dir)
+                       if self._rank == 0 else None)
+
+    # ── 属性 ──
+
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
+    @property
+    def _device_str(self) -> str:
+        d = self.device
+        return 'cuda' if d.type == 'cuda' else str(d)
+
+    @property
+    def _gpu_name(self) -> str:
+        if self.device.type != 'cuda':
+            return 'CPU'
+        return torch.cuda.get_device_name(self.device)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 主循环
+    # ═══════════════════════════════════════════════════════════════
 
     def train(self):
-        """主训练循环。
-
-        标准流程（后端无关）:
-        1. 设置 LR
-        2. 评估 + checkpoint（按 interval）
-        3. 梯度累积循环:
-           a. autocast 前向
-           b. backward（后端控制同步时机）
-           c. 异步预取下一 batch
-        4. unscale → clip → step → zero_grad
-        5. 日志
-        """
         config = self.config
-        backend = self.backend
+        device_type = self._device_str
+        use_amp = device_type == 'cuda' and config.dtype != 'float32'
+        amp_dtype = {'float16': torch.float16, 'bfloat16': torch.bfloat16}.get(
+            config.dtype, torch.float16)
 
-        # 启动 GPU 监控
-        if self.logger is not None:
+        if self.logger:
             self.logger.start_gpu_monitor()
 
-        # 预取第一个 batch
-        X, Y = self._get_batch('train')
+        X, Y = self._fetch('train')
         t0 = time.time()
 
         while True:
-            # ── 1. 设置学习率 ──
+            # ── 1. LR ──
             lr = self.scheduler(self.iter_num)
             for pg in self.optimizer.param_groups:
                 pg['lr'] = lr
 
-            # ── 2. 评估 + Checkpoint ──
-            if self.iter_num % config.eval_interval == 0 and backend.is_master:
-                self._evaluate_and_checkpoint()
+            # ── 2. 评估 + checkpoint ──
+            if self.iter_num % config.eval_interval == 0 and self._rank == 0:
+                self._eval_and_save()
 
-            # eval_only 模式：评估一次就退出
             if self.iter_num == 0 and config.eval_only:
                 break
 
-            # ── 3. 梯度累积循环 ──
-            micro_step = 0
-            loss_val = None  # 防止循环体未执行时未定义
+            # ── 3. 梯度累积 ──
             for micro_step in range(config.gradient_accumulation_steps):
                 is_last = (micro_step == config.gradient_accumulation_steps - 1)
 
-                # 检查退出信号（Ctrl-C 可能在微批次循环中触发）
                 if self.stopper.should_stop():
                     break
 
-                with backend.autocast_context():
-                    logits, loss = self.model(X, Y)
+                # 前向
+                with (torch.amp.autocast(device_type, dtype=amp_dtype)
+                      if use_amp else _nullcontext()):
+                    _, loss = self.model(X, Y)
                     loss = loss / config.gradient_accumulation_steps
 
-                # detach 保存 loss 值（不触发 GPU 同步，异步流水线不被打断）
                 loss_val = loss.detach()
 
-                # 异步预取下一 batch（与 GPU backward 并行）
+                # 预取
                 try:
-                    X, Y = self._get_batch('train')
+                    X, Y = self._fetch('train')
                 except RuntimeError as e:
                     if "DataLoader worker" in str(e):
-                        print(f"\n[WARNING] DataLoader worker 异常退出，可能是 Ctrl-C")
+                        print("[WARNING] DataLoader worker 异常退出")
                         self.stopper._stop_requested = True
                         break
                     raise
 
-                # 反向传播（DDP: 非最后步通过 model.no_sync() 跳过 all-reduce）
-                backend.backward(self.model, loss, is_last_micro_step=is_last)
+                # 反向
+                s_loss = self.scaler.scale(loss) if self.scaler else loss
+                if self.ddp and not is_last:
+                    with self.model.no_sync():
+                        s_loss.backward()
+                else:
+                    s_loss.backward()
 
-            # 整个梯度累积完成后才同步取 loss（只 sync 一次）
             self._last_loss = loss_val.item() if loss_val is not None else 0.0
 
-            # 微批次循环提前退出 → 梯度不完整 → 跳过参数更新
+            # 微批次不完整 → 跳过参数更新
             if micro_step < config.gradient_accumulation_steps - 1:
-                if not self.stopper._stop_requested:
-                    self._last_loss = 0.0
-                continue  # 回到 while True 开头，触发终止条件退出
+                continue
 
-            # ── 4. 梯度裁剪 → 更新参数 → 清零 ──
+            # ── 4. 梯度裁剪 + 更新 ──
+            if self.scaler:
+                self.scaler.unscale_(self.optimizer)
             if config.grad_clip > 0.0:
-                backend.unscale(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.raw_model.parameters(), config.grad_clip
-                )
-            backend.step(self.optimizer)
-            backend.zero_grad(self.optimizer)
+                    self.raw_model.parameters(), config.grad_clip)
+            if self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            # ── 5. 日志 + MFU ──
+            # ── 5. 日志 ──
             t1 = time.time()
             dt = t1 - t0
             t0 = t1
-
-            if self.iter_num % config.log_interval == 0 and backend.is_master:
+            if self.iter_num % config.log_interval == 0 and self._rank == 0:
                 self._log(dt)
 
             self.iter_num += 1
 
-            # ── 终止条件 ──
+            # ── 终止 ──
             if self.iter_num > config.max_iters or self.stopper.should_stop():
                 if self.stopper._stop_requested:
-                    if backend.is_master:
+                    if self._rank == 0:
                         self._save_checkpoint()
-                    # 非 master 等一等 master 保存完
-                    if backend.world_size > 1:
-                        import torch.distributed as dist
-                        dist.barrier()
-                    if backend.is_master:
-                        print(f"[INFO] 优雅退出，checkpoint 已保存 (iter {self.iter_num})")
+                        print(f"[INFO] 优雅退出，checkpoint 已保存 "
+                              f"(iter {self.iter_num})")
                 break
 
-        backend.cleanup()
-        self.stopper.cleanup()
-        if self.logger is not None:
+        if dist.is_initialized():
+            dist.barrier()
+        if self.logger:
             self.logger.stop_gpu_monitor()
 
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
     # 评估 & Checkpoint
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
 
     @torch.no_grad()
-    def _evaluate_and_checkpoint(self):
-        """评估 train/val loss，保存 checkpoint。"""
-        config = self.config
-        backend = self.backend
-
+    def _eval_and_save(self):
         losses = self._estimate_loss()
-        print(f"step {self.iter_num}: train loss {losses['train']:.4f}, "
-              f"val loss {losses['val']:.4f}")
+        train_loss = losses['train'].item() if isinstance(losses['train'], torch.Tensor) else losses['train']
+        val_loss = losses['val'].item() if isinstance(losses['val'], torch.Tensor) else losses['val']
+        print(f"step {self.iter_num}: train loss {train_loss:.4f}, "
+              f"val loss {val_loss:.4f}")
 
-        # 写入状态文件
-        if self.logger is not None:
-            lr = self.scheduler(self.iter_num)
+        lr = self.scheduler(self.iter_num)
+        if self.logger:
             self.logger.write_status_file(
-                self.iter_num, losses['train'], lr, self.best_val_loss
-            )
+                self.iter_num, train_loss, lr, self.best_val_loss)
 
-        # Wandb 日志
-        if self.wandb is not None:
-            self.wandb.log({
-                "iter": self.iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": self.scheduler(self.iter_num),
-                "mfu": self.running_mfu * 100,
-            })
-
-        # 保存 checkpoint
-        if losses['val'] < self.best_val_loss or config.always_save_checkpoint:
-            self.best_val_loss = losses['val']
+        if val_loss < self.best_val_loss or self.config.always_save_checkpoint:
+            self.best_val_loss = val_loss
             if self.iter_num > 0:
                 self._save_checkpoint()
 
     @torch.no_grad()
     def _estimate_loss(self) -> dict:
-        """在 train/val 上采样评估 loss。"""
-        config = self.config
-        backend = self.backend
-
         self.model.eval()
         out = {}
+        dtype = self.config.dtype
+        use_amp = self._device_str == 'cuda' and dtype != 'float32'
+        amp_dtype = {'float16': torch.float16, 'bfloat16': torch.bfloat16}.get(
+            dtype, torch.float16)
+
         for split in ['train', 'val']:
-            losses = torch.zeros(config.eval_iters)
-            for k in range(config.eval_iters):
-                X, Y = self._get_batch(split)
-                with backend.autocast_context():
+            losses = torch.zeros(self.config.eval_iters)
+            for k in range(self.config.eval_iters):
+                X, Y = self._fetch(split)
+                with (torch.amp.autocast(self._device_str, dtype=amp_dtype)
+                      if use_amp else _nullcontext()):
                     _, loss = self.model(X, Y)
                 losses[k] = loss.item()
-            out[split] = losses.mean().item()
+            out[split] = losses.mean()
         self.model.train()
         return out
 
     def _save_checkpoint(self):
-        """保存完整训练状态到磁盘。"""
-        config = self.config
-        os.makedirs(config.out_dir, exist_ok=True)
-
-        checkpoint = {
+        os.makedirs(self.config.out_dir, exist_ok=True)
+        ckpt = {
             'model': self.raw_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'model_args': self.raw_model.config.to_dict(),
-            'config': config.to_dict(),
+            'config': self.config.to_dict(),
             'iter_num': self.iter_num,
             'best_val_loss': self.best_val_loss,
         }
-        ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
-        torch.save(checkpoint, ckpt_path)
-        print(f"saving checkpoint to {ckpt_path}")
+        torch.save(ckpt, os.path.join(self.config.out_dir, 'ckpt.pt'))
+        print(f"saving checkpoint to {self.config.out_dir}/ckpt.pt")
 
     def load_checkpoint(self) -> int:
-        """从 checkpoint 恢复训练状态。返回恢复时的 iter_num。"""
-        config = self.config
-        ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
-
+        ckpt_path = os.path.join(self.config.out_dir, 'ckpt.pt')
         if not os.path.exists(ckpt_path):
-            print(f"no checkpoint found at {ckpt_path}, starting from scratch")
+            print(f"no checkpoint at {ckpt_path}")
             return 0
-
-        checkpoint = torch.load(ckpt_path, map_location=self.backend.device)
-
-        # 恢复模型权重
-        state_dict = checkpoint['model']
-        # 兼容: 移除 torch.compile 产生的 _orig_mod. 前缀
-        unwanted_prefix = '_orig_mod.'
-        for k in list(state_dict.keys()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        self.raw_model.load_state_dict(state_dict)
-
-        # 恢复优化器
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-
-        # 恢复训练状态
-        self.iter_num = checkpoint['iter_num']
-        self.best_val_loss = checkpoint['best_val_loss']
-
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        sd = ckpt['model']
+        for k in list(sd.keys()):
+            if k.startswith('_orig_mod.'):
+                sd[k[len('_orig_mod.'):]] = sd.pop(k)
+        self.raw_model.load_state_dict(sd)
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        self.iter_num = ckpt['iter_num']
+        self.best_val_loss = ckpt['best_val_loss']
         print(f"resumed from {ckpt_path} at iter {self.iter_num}")
         return self.iter_num
 
-    # ═══════════════════════════════════════════════════════════════════
-    # 日志 & MFU
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
+    # 数据 / 日志
+    # ═══════════════════════════════════════════════════════════════
+
+    def _fetch(self, split: str):
+        it = self._train_iter if split == 'train' else self._val_iter
+        X, Y = next(it)
+        if self.device.type == 'cuda':
+            X = X.to(self.device, non_blocking=True)
+            Y = Y.to(self.device, non_blocking=True)
+        else:
+            X, Y = X.to(self.device), Y.to(self.device)
+        return X, Y
 
     def _log(self, dt: float):
-        """打印一步的训练指标（委托给 TrainingLogger）。"""
         lossf = self._last_loss * self.config.gradient_accumulation_steps
         lr = self.scheduler(self.iter_num)
-
-        # 计算 MFU
-        if self.iter_num >= 5 and self.logger is not None:
+        if self.iter_num >= 5 and self.logger:
             mfu = self.logger.compute_mfu(dt)
-            self.running_mfu = mfu
         else:
-            self.running_mfu = -1.0
-
-        if self.logger is not None:
-            self.logger.log_step(self.iter_num, lossf, dt, lr,
-                                 max(self.running_mfu, 0.0))
-            # 每 10 步更新一次状态文件
+            mfu = 0.0
+        if self.logger:
+            self.logger.log_step(self.iter_num, lossf, dt, lr, mfu)
             if self.iter_num % 10 == 0:
                 self.logger.write_status_file(
-                    self.iter_num, lossf, lr, self.best_val_loss
-                )
+                    self.iter_num, lossf, lr, self.best_val_loss)
 
-    # ═══════════════════════════════════════════════════════════════════
-    # 数据获取
-    # ═══════════════════════════════════════════════════════════════════
 
-    def _get_batch(self, split: str):
-        """获取一个 batch 并异步传输到 GPU。
+# ── 工具 ──
 
-        数据源:
-        - DataLoader + IterableDataset: 已 pin_memory，直接 .to(device, non_blocking)
-        - DataProvider (旧接口): 手动 pin_memory + 传输
-        """
-        device = self.backend.device
-        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-
-        if self._train_iter is not None:
-            # 新接口: DataLoader 持久迭代器（pin_memory 已由 DataLoader 处理）
-            it = self._train_iter if split == 'train' else self._val_iter
-            X, Y = next(it)
-        elif self.data is not None:
-            # 旧接口: DataProvider
-            X, Y = self.data.get_batch(split)
-        else:
-            raise RuntimeError(
-                "No data source set. Pass data_provider or loaders dict to Trainer."
-            )
-
-        if device_type == 'cuda':
-            X = X.to(device, non_blocking=True)
-            Y = Y.to(device, non_blocking=True)
-        else:
-            X, Y = X.to(device), Y.to(device)
-        return X, Y
+class _nullcontext:
+    """兼容 Python < 3.10 的 nullcontext。"""
+    def __enter__(self): return None
+    def __exit__(self, *args): pass

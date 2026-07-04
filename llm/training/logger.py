@@ -68,21 +68,18 @@ GPU_DATABASE = {
 _UNKNOWN_DEFAULT = GPUInfo("Unknown-GPU", 80, 80, 16)
 
 
-def _detect_gpu(device) -> GPUInfo:
-    """通过 torch.cuda.get_device_name() 匹配 GPU 数据库。"""
-    import torch
-
-    if not torch.cuda.is_available() or device.type != "cuda":
+def _detect_gpu_by_name(gpu_name: str, device_type: str) -> GPUInfo:
+    """通过 GPU 名称匹配数据库。"""
+    if device_type != 'cuda' or not gpu_name:
         return GPUInfo("CPU", 0, 0, 0)
 
-    name = torch.cuda.get_device_name(device)
     for key, info in GPU_DATABASE.items():
-        if key.lower() in name.lower():
+        if key.lower() in gpu_name.lower():
             return info
 
-    print(f"[WARNING] 未知 GPU: '{name}'，MFU 基准使用保守估算 (80 TFLOPS)。"
+    print(f"[WARNING] 未知 GPU: '{gpu_name}'，MFU 基准使用保守估算 (80 TFLOPS)。"
           f" 请在 GPU_DATABASE 中添加此型号。")
-    return GPUInfo(name, 80, 80, 16)
+    return GPUInfo(gpu_name, 80, 80, 16)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -98,13 +95,16 @@ class TrainingLogger:
         self.logger.write_status_file(iter_num, loss, lr, best_val)
     """
 
-    def __init__(self, config, backend, raw_model):
+    def __init__(self, config, device_type: str, gpu_name: str,
+                 raw_model, world_size: int, out_dir: str):
+        import torch
+
         self.config = config
-        self.backend = backend
         self.model = raw_model
+        self._world_size = world_size
 
         # ── GPU 检测 + MFU 基准 ──
-        self.gpu_info = _detect_gpu(backend.device)
+        self.gpu_info = _detect_gpu_by_name(gpu_name, device_type)
         dtype = config.dtype
         if dtype == "bfloat16" and self.gpu_info.bf16_tflops == 0:
             print(f"[WARNING] {self.gpu_info.name} 不支持 bfloat16！"
@@ -116,7 +116,7 @@ class TrainingLogger:
         ) * 1e12  # → FLOPS
 
         # ── 输出路径 ──
-        self.out_dir = config.out_dir
+        self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
         self.log_path = os.path.join(self.out_dir, "train.log")
         self.status_path = os.path.join(self.out_dir, "status.json")
@@ -128,6 +128,9 @@ class TrainingLogger:
 
         # ── GPU 利用率后台监控 ──
         self._gpu_util: float = 0.0
+        self._device_idx: int = 0
+        if device_type == 'cuda':
+            self._device_idx = torch.cuda.current_device()
         self._monitor_stop = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -142,19 +145,20 @@ class TrainingLogger:
         """启动时写入一次环境信息。"""
         import torch
 
+        bs = self.config.batch_size
+        ga = self.config.gradient_accumulation_steps
         lines = [
             f"{'=' * 70}",
             f"Training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"GPU: {self.gpu_info.name} ({self.gpu_info.memory_gib:.0f} GiB)",
+            f"GPU: {self.gpu_info.name} ({self.gpu_info.memory_gib:.0f} GiB)"
+            f" × {self._world_size}",
             f"dtype: {self.config.dtype} | backend: {self.config.backend}",
             f"model: {self.model.config.n_layer} layers, "
             f"{self.model.config.n_head} heads, "
             f"{self.model.config.n_embd} dim",
             f"params: {self.model.get_num_params()/1e6:.2f}M",
-            f"batch_size: {self.config.batch_size} × "
-            f"grad_accum={self.config.gradient_accumulation_steps} × "
-            f"world_size={self.backend.world_size} = "
-            f"{self.config.batch_size * self.config.gradient_accumulation_steps * self.backend.world_size}",
+            f"total batch: {bs} × {ga} × {self._world_size} = "
+            f"{bs * ga * self._world_size}",
             f"MFU baseline: {self._mfu_baseline/1e12:.0f} TFLOPS "
             f"({'bf16' if self.config.dtype == 'bfloat16' else 'fp16'})",
             f"{'=' * 70}",
@@ -197,7 +201,7 @@ class TrainingLogger:
             config.gradient_accumulation_steps
             * config.batch_size
             * self.model.config.block_size
-            * self.backend.world_size
+            * self._world_size
         )
         tokens_per_sec = tokens_per_step / dt
 
@@ -268,11 +272,7 @@ class TrainingLogger:
         except ImportError:
             return  # 静默跳过
 
-        device_idx = (
-            self.backend.device.index
-            if self.backend.device.index is not None
-            else 0
-        )
+        device_idx = self._device_idx
 
         def _loop():
             while not self._monitor_stop.is_set():
@@ -326,7 +326,7 @@ class TrainingLogger:
             "gpu_util_pct": round(self._gpu_util, 1),
             "dtype": self.config.dtype,
             "backend": self.config.backend,
-            "world_size": self.backend.world_size,
+            "world_size": self._world_size,
         }
 
         tmp = self.status_path + ".tmp"
@@ -346,12 +346,12 @@ class TrainingLogger:
             config.gradient_accumulation_steps
             * config.batch_size
             * self.model.config.block_size
-            * self.backend.world_size
+            * self._world_size
         )
         mfu = self.model.estimate_mfu(fwdbwd_per_iter, dt)
 
-        # 使用实际的 GPU 基准修正 estimate_mfu() 中的 A100 硬编码
-        mfu *= 312e12 / self._mfu_baseline
+        # 修正: estimate_mfu() 硬编码 A100 312 TFLOPS → 用实际 GPU 基准
+        mfu *= 312e12 / max(self._mfu_baseline, 1e12)
 
         # 指数平滑
         self._running_mfu = (
