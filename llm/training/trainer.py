@@ -21,21 +21,7 @@ from llm.training.logger import TrainingLogger
 
 
 class Trainer:
-    """训练编排器。
-
-    所有并行策略（DDP/FSDP/DeepSpeed）由 train.py 在外部设置好，
-    Trainer 不感知具体后端，只运行标准训练循环。
-
-    参数:
-        model:       已包装好（DDP/FSDP/DeepSpeed）或裸模型
-        optimizer:   AdamW 等优化器
-        config:      TrainingConfig
-        train_loader: DataLoader（已 pin_memory）
-        val_loader:   DataLoader
-        raw_model:   DDP 包装前的原始模型（checkpoint 保存用，None=同 model）
-        scaler:      GradScaler（fp16 时传入，bf16/fp32 时 None）
-        ddp:         True 表示 model 是 DDP 包装（需 no_sync 控制梯度同步）
-    """
+    """训练编排器。"""
 
     def __init__(
         self,
@@ -55,11 +41,9 @@ class Trainer:
         self.scaler = scaler
         self.ddp = ddp
 
-        # 持久迭代器
         self._train_iter = iter(train_loader)
         self._val_iter = iter(val_loader)
 
-        # LR 调度
         if config.decay_lr:
             self.scheduler = WarmupCosineSchedule(
                 lr_max=config.learning_rate, lr_min=config.min_lr,
@@ -69,15 +53,12 @@ class Trainer:
         else:
             self.scheduler = ConstantSchedule(config.learning_rate)
 
-        # 训练状态
         self.iter_num = 0
         self.best_val_loss = float('inf')
         self._last_loss = 0.0
 
-        # 优雅退出
         self.stopper = GracefulStopper(config.out_dir)
 
-        # 日志（仅 rank 0）
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.logger = (TrainingLogger(config, self._device_str, self._gpu_name,
@@ -133,9 +114,9 @@ class Trainer:
                 break
 
             # ── 3. 梯度累积 ──
+            micro_step = 0
+            loss_val = None
             for micro_step in range(config.gradient_accumulation_steps):
-                is_last = (micro_step == config.gradient_accumulation_steps - 1)
-
                 if self.stopper.should_stop():
                     break
 
@@ -152,12 +133,13 @@ class Trainer:
                     X, Y = self._fetch('train')
                 except RuntimeError as e:
                     if "DataLoader worker" in str(e):
-                        print("[WARNING] DataLoader worker 异常退出")
-                        self.stopper._stop_requested = True
+                        print(f"[rank{self._rank}] DataLoader worker 异常退出")
+                        self.stopper._stopping = True
                         break
                     raise
 
                 # 反向
+                is_last = (micro_step == config.gradient_accumulation_steps - 1)
                 s_loss = self.scaler.scale(loss) if self.scaler else loss
                 if self.ddp and not is_last:
                     with self.model.no_sync():
@@ -167,8 +149,11 @@ class Trainer:
 
             self._last_loss = loss_val.item() if loss_val is not None else 0.0
 
-            # 微批次不完整 → 跳过参数更新
+            # 微批次不完整 → 跳过参数更新，检查退出
             if micro_step < config.gradient_accumulation_steps - 1:
+                if self.stopper.is_stopping:
+                    self._shutdown()
+                    return
                 continue
 
             # ── 4. 梯度裁剪 + 更新 ──
@@ -194,16 +179,20 @@ class Trainer:
             self.iter_num += 1
 
             # ── 终止 ──
-            if self.iter_num > config.max_iters or self.stopper.should_stop():
-                if self.stopper._stop_requested:
-                    if self._rank == 0:
-                        self._save_checkpoint()
-                        print(f"[INFO] 优雅退出，checkpoint 已保存 "
-                              f"(iter {self.iter_num})")
-                break
+            if self.iter_num > config.max_iters or self.stopper.is_stopping:
+                self._shutdown()
+                return
 
+    def _shutdown(self):
+        """统一退出: DDP 同步 → checkpoint 保存 → 清理。"""
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier()                    # 等所有 rank 到达此点
+        if self._rank == 0 and self.iter_num > 0:
+            self._save_checkpoint()
+            print(f"[INFO] 已保存 checkpoint (iter {self.iter_num})")
+        if dist.is_initialized():
+            dist.barrier()                    # 等 rank-0 保存完成
+        self.stopper.cleanup()
         if self.logger:
             self.logger.stop_gpu_monitor()
 
@@ -308,9 +297,6 @@ class Trainer:
                     self.iter_num, lossf, lr, self.best_val_loss)
 
 
-# ── 工具 ──
-
 class _nullcontext:
-    """兼容 Python < 3.10 的 nullcontext。"""
     def __enter__(self): return None
     def __exit__(self, *args): pass

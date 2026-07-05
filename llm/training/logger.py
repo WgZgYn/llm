@@ -190,11 +190,11 @@ class TrainingLogger:
         if len(self._step_times) > 100:
             self._step_times.pop(0)
 
-        # ── 显存 ──
+        # ── 显存 (GPU memory) ──
         import torch
         mem_alloc = torch.cuda.memory_allocated() / 1024**3
         mem_reserved = torch.cuda.memory_reserved() / 1024**3
-        mem_rsvd_extra = mem_reserved - mem_alloc
+        mem_cached = mem_reserved - mem_alloc
 
         # ── Tokens/sec ──
         tokens_per_step = (
@@ -228,10 +228,10 @@ class TrainingLogger:
             f"dt {dt*1000:.0f}ms | "
             f"tok/s {tokens_per_sec:,.0f} | "
             f"mfu {mfu*100:5.1f}%{mfu_note} | "
-            f"vram {mem_alloc:.1f}/{self.gpu_info.memory_gib:.0f}GiB"
+            f"gmem {mem_alloc:.1f}/{self.gpu_info.memory_gib:.0f}GiB"
         )
-        if mem_rsvd_extra > 0.5:
-            line += f" (+{mem_rsvd_extra:.1f}GiB rsvd)"
+        if mem_cached > 0.5:
+            line += f" (+{mem_cached:.1f}GiB cache)"
         line += f" | gpu {self._gpu_util:.0f}%"
         line += f" | ETA {eta_str}"
 
@@ -319,10 +319,13 @@ class TrainingLogger:
             "avg_dt_ms": round(avg_dt * 1000, 1),
             "mfu_pct": round(self._running_mfu * 100, 1),
             "gpu_name": self.gpu_info.name,
-            "vram_alloc_gib": round(
+            "gmem_used_gib": round(
                 torch.cuda.memory_allocated() / 1024**3, 1
             ),
-            "vram_total_gib": self.gpu_info.memory_gib,
+            "gmem_total_gib": self.gpu_info.memory_gib,
+            "gmem_cached_gib": round(
+                (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / 1024**3, 1
+            ),
             "gpu_util_pct": round(self._gpu_util, 1),
             "dtype": self.config.dtype,
             "backend": self.config.backend,
@@ -342,10 +345,10 @@ class TrainingLogger:
         """使用检测到的 GPU 基准计算 MFU。"""
         config = self.config
 
+        # fwdbwd_per_iter = 每次 step 处理的序列数（不含 block_size）
         fwdbwd_per_iter = (
             config.gradient_accumulation_steps
             * config.batch_size
-            * self.model.config.block_size
             * self._world_size
         )
         mfu = self.model.estimate_mfu(fwdbwd_per_iter, dt)

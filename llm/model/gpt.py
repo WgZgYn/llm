@@ -53,7 +53,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),       # token 嵌入
             wpe=nn.Embedding(config.block_size, config.n_embd),       # 位置嵌入（可学习）
             drop=nn.Dropout(config.dropout),                           # 嵌入 dropout
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  # Transformer blocks
+            h=nn.ModuleList([self._make_block(config, i) for i in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),          # 最终 LayerNorm
         ))
 
@@ -92,6 +92,11 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()  # 位置嵌入不算
         return n_params
+
+    def _make_block(self, config: GPTConfig, layer_idx: int) -> nn.Module:
+        """构造一个 Transformer Block。子类重写此方法以实现变种（如 MoE）。"""
+        return Block(config.n_embd, config.n_head, config.block_size,
+                     config.bias, config.dropout)
 
     def _init_weights(self, module):
         """统一的权重初始化。
@@ -149,6 +154,13 @@ class GPT(nn.Module):
                 targets.view(-1),
                 ignore_index=-1
             )
+
+            # ── 收集 MoE 辅助 loss ──
+            if self.training:
+                for block in self.transformer.h:
+                    moe = getattr(block, 'mlp', None)
+                    if moe is not None and hasattr(moe, 'pop_aux_loss'):
+                        loss = loss + moe.pop_aux_loss()
         else:
             # 推理优化: 只计算最后一个位置的 logits
             # 用 [-1] 而不是 [-1:] 保留时间维度（torch.compile 友好）
@@ -237,11 +249,11 @@ class GPT(nn.Module):
     def estimate_mfu(self, fwdbwd_per_iter: int, dt: float) -> float:
         """估算 Model FLOPs Utilization (MFU)。
 
-        以 A100 bfloat16 峰值 312 TFLOPS 为基准。
+        以 A100 bfloat16 峰值 312 TFLOPS 为基准，logger 会自动修正为实际 GPU。
 
         参数:
-            fwdbwd_per_iter: 每次迭代处理的总 token 数
-                             (batch_size × block_size × gradient_accumulation_steps)
+            fwdbwd_per_iter: 每次 optimizer step 处理的序列数
+                             (gradient_accumulation_steps × batch_size × world_size)
             dt:              单次迭代耗时（秒）
 
         返回:
@@ -252,12 +264,15 @@ class GPT(nn.Module):
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
 
+        # flops_per_token: 每个 token 的前向+反向 FLOPs
         flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # flops_per_seq: 一个完整序列 (长度 T) 的前向+反向 FLOPs
+        flops_per_seq = flops_per_token * T
+        # flops_per_iter: 一次 optimizer step 的总 FLOPs
+        flops_per_iter = flops_per_seq * fwdbwd_per_iter
 
-        flops_achieved = flops_per_iter * (1.0 / dt)  # FLOPS per second
-        flops_promised = 312e12                         # A100 bfloat16 peak
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12  # A100 bfloat16 peak (logger 中按实际 GPU 修正)
         return flops_achieved / flops_promised
 
     # ═══════════════════════════════════════════════════════════════════

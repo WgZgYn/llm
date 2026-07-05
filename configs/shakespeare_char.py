@@ -7,7 +7,7 @@
 用法:
     python scripts/train.py configs/shakespeare_char.py
 """
-
+import llm
 from llm.config import GPTConfig, TrainingConfig
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -26,6 +26,8 @@ model = GPTConfig(
     dropout=0.0,              # 预训练无需 dropout
     bias=True,                # 与 GPT-2 行为一致
 )
+
+model_obj = llm.GPT(model)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 训练参数

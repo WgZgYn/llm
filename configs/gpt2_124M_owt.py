@@ -8,7 +8,7 @@
     # 单节点 8 GPU
     torchrun --standalone --nproc_per_node=8 scripts/train.py configs/gpt2_124M_owt.py
 """
-
+import llm
 from llm.config import GPTConfig, TrainingConfig
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -24,6 +24,8 @@ model = GPTConfig(
     dropout=0.0,               # 预训练 dropout=0
     bias=True,                 # GPT-2 使用 bias
 )
+
+model_obj = llm.GPT(model)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 训练参数
