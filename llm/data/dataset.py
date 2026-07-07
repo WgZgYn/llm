@@ -311,7 +311,7 @@ class AdditionDataset(Dataset):
 def collate_addition_batch(batch, pad_id: int = -1):
     """加法任务的 batch 整理函数：padding 到统一长度。"""
     if pad_id == -1:
-        pad_id = 14  # '_' 的默认位置
+        pad_id = 13  # '_' 的索引（vocab 中最后一位）
 
     xs, ys = zip(*batch)
     xs = torch.nn.utils.rnn.pad_sequence(xs, batch_first=True, padding_value=pad_id)
