@@ -1,4 +1,4 @@
-"""GPT-2 124M + MoE 变种配置。
+"""GPT-2 30M + MoE 变种配置。
 
 在 OpenWebText 上训练，中间层替换为 MoE_FFN（8 experts, top-2 激活）。
 
@@ -41,5 +41,5 @@ model_obj = MoEGPT(
     model,
     num_experts=8,        # 8 个 expert
     top_k=2,              # 每 token 激活 2 个
-    moe_layers=(6, 7),    # 第 3~8 层用 MoE，首尾保持标准 MLP
+    moe_layers=(6, 7),    # 最后一次层用 MoE，首尾保持标准 MLP
 )
