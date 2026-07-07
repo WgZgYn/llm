@@ -71,7 +71,7 @@ def _find_max_batch(model, device, seq_len, scaler, optimizer, ddp=False, max_se
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["single","ddp","fsdp"], default="single")
-    parser.add_argument("--model", choices=["small","medium","large","xl"], default="medium")
+    parser.add_argument("--model", choices=["small","medium","large","xl","2b"], default="medium")
     parser.add_argument("--seq-len", type=int, default=1024)
     args = parser.parse_args()
 
@@ -89,10 +89,11 @@ def main():
 
     # ── 模型配置 ──
     cfgs = {
-        "small":  dict(n_layer=8,  n_embd=512, n_head=8),
-        "medium": dict(n_layer=12, n_embd=768, n_head=12),
-        "large":  dict(n_layer=24, n_embd=1024, n_head=16),
-        "xl":     dict(n_layer=36, n_embd=1280, n_head=20),
+        "small":  dict(n_layer=8,  n_embd=512, n_head=8),     # ~25M
+        "medium": dict(n_layer=12, n_embd=768, n_head=12),    # ~86M
+        "large":  dict(n_layer=24, n_embd=1024, n_head=16),   # ~350M
+        "xl":     dict(n_layer=36, n_embd=1280, n_head=20),   # ~711M
+        "2b":     dict(n_layer=48, n_embd=1600, n_head=25),   # ~1.5B
     }
     cfg = cfgs[args.model]
 
