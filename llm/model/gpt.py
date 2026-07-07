@@ -96,7 +96,8 @@ class GPT(nn.Module):
     def _make_block(self, config: GPTConfig, layer_idx: int) -> nn.Module:
         """构造一个 Transformer Block。子类重写此方法以实现变种（如 MoE）。"""
         return Block(config.n_embd, config.n_head, config.block_size,
-                     config.bias, config.dropout)
+                     config.bias, config.dropout,
+                     checkpoint=config.gradient_checkpointing)
 
     def _init_weights(self, module):
         """统一的权重初始化。
@@ -116,54 +117,51 @@ class GPT(nn.Module):
     # 前向传播
     # ═══════════════════════════════════════════════════════════════════
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        """前向传播。
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
+                kv_cache: list[dict] | None = None):
+        """前向传播，支持 KV-Cache 推理加速。
 
         参数:
-            idx:    输入 token ids [batch_size, seq_len]
-            targets: 目标 token ids [batch_size, seq_len]，为 None 时仅预测最后位置
-
-        返回:
-            (logits, loss): loss 仅在 targets 不为 None 时有值
+            idx:      [B, T] 或 [B, 1] (cache 模式下通常只有 1 个新 token)
+            targets:  [B, T]，None 时仅推理
+            kv_cache: 每个 Block 一个 dict {'k': ..., 'v': ...}，None 时不使用
         """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, \
             f"序列长度 {t} 超过 block_size {self.config.block_size}"
 
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # 位置编码: cache 模式下只取最后一个位置
+        if kv_cache is not None and len(kv_cache) > 0 and 'k' in kv_cache[0]:
+            cache_len = kv_cache[0]['k'].size(2)  # 已经缓存的长度
+            pos = torch.arange(cache_len, cache_len + t, dtype=torch.long, device=device)
+        else:
+            cache_len = 0
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        # ── 嵌入层 ──
-        tok_emb = self.transformer.wte(idx)          # token 嵌入 [B, T, n_embd]
-        pos_emb = self.transformer.wpe(pos)           # 位置嵌入 [T, n_embd]
-        x = self.transformer.drop(tok_emb + pos_emb)  # 相加 + dropout
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
 
-        # ── Transformer blocks ──
-        for block in self.transformer.h:
-            x = block(x)
+        # 穿行 blocks，逐个传递 kv_cache
+        for i, block in enumerate(self.transformer.h):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            x = block(x, layer_cache)
 
-        # ── 最终 LayerNorm ──
         x = self.transformer.ln_f(x)
 
-        # ── 输出 ──
         if targets is not None:
-            # 训练模式: 对所有位置计算 loss
-            logits = self.lm_head(x)  # [B, T, vocab_size]
+            logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1
-            )
-
-            # ── 收集 MoE 辅助 loss ──
+                ignore_index=self.config.ignore_index)
             if self.training:
                 for block in self.transformer.h:
                     moe = getattr(block, 'mlp', None)
                     if moe is not None and hasattr(moe, 'pop_aux_loss'):
                         loss = loss + moe.pop_aux_loss()
         else:
-            # 推理优化: 只计算最后一个位置的 logits
-            # 用 [-1] 而不是 [-1:] 保留时间维度（torch.compile 友好）
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
@@ -180,43 +178,49 @@ class GPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
-        """自回归文本生成。
+        """自回归文本生成，可选 KV-Cache 加速。
 
         参数:
             idx:             初始 token ids [batch_size, prefix_len]
             max_new_tokens:  最多生成多少个新 token
-            temperature:     温度（>1 更随机，<1 更确定，=1 原始分布）
-            top_k:           只从概率最高的 k 个 token 中采样（None = 不限制）
-
-        返回:
-            完整序列（输入 + 生成的）[batch_size, prefix_len + new_tokens]
+            temperature:     温度
+            top_k:           top-k 采样
+            use_cache:       是否使用 KV-Cache（默认 True）
         """
-        for _ in range(max_new_tokens):
-            # 如果序列过长，裁剪到 block_size
-            idx_cond = (
-                idx
-                if idx.size(1) <= self.config.block_size
-                else idx[:, -self.config.block_size:]
-            )
+        # ── 没有 cache 的慢路径（原逻辑，兼容）──
+        if not use_cache:
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.block_size \
+                    else idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
 
-            # 前向传播（只取最后位置的 logits）
-            logits, _ = self(idx_cond)
+        # ── KV-Cache 路径（快）──
+        n_layers = self.config.n_layer
+        kv_cache = [{} for _ in range(n_layers)]
 
-            # 温度缩放
+        next_input = idx  # [B, T] or [B, 1]
+        for step in range(max_new_tokens):
+            logits, _ = self(next_input, kv_cache=kv_cache)
+
+            # 采样下一个 token
             logits = logits[:, -1, :] / temperature
-
-            # Top-K 筛选
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-
-            # 采样
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            next_input = torch.multinomial(probs, num_samples=1)  # [B, 1]
 
-            # 拼接
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, next_input), dim=1)
 
         return idx
 

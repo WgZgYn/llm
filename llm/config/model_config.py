@@ -26,6 +26,8 @@ class GPTConfig:
     # ── 正则化 ──
     dropout: float = 0.0         # 预训练建议 0.0，微调建议 0.1+
     bias: bool = True           # Linears 和 LayerNorms 中是否使用 bias
+    ignore_index: int = -1      # loss 忽略的 token id（14=Addition PAD，-1=不忽略）
+    gradient_checkpointing: bool = False  # 激活重计算（省 40% 显存，慢 20%）
 
     def __post_init__(self):
         if self.n_head > 0 and self.n_embd > 0:

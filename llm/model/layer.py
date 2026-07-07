@@ -58,23 +58,33 @@ class CausalSelfAttention(nn.Module):
             mask = torch.tril(torch.ones(block_size, block_size))
             self.register_buffer("bias", mask.view(1, 1, block_size, block_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: dict | None = None):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
+        # KV-Cache: 拼接历史 K,V
+        if kv_cache is not None and 'k' in kv_cache:
+            k = torch.cat([kv_cache['k'], k], dim=2)
+            v = torch.cat([kv_cache['v'], v], dim=2)
+        if kv_cache is not None:
+            kv_cache['k'] = k
+            kv_cache['v'] = v
+
         if self.flash:
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
+                is_causal=(kv_cache is None),
             )
         else:
             scale = 1.0 / math.sqrt(self.head_dim)
             att = (q @ k.transpose(-2, -1)) * scale
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            if kv_cache is None:
+                att = att.masked_fill(
+                    self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
@@ -118,23 +128,39 @@ class MLP(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Block(nn.Module):
-    """Pre-LN Transformer Block，可插拔 ffn。
+    """Pre-LN Transformer Block，可插拔 ffn，可选梯度检查点。
 
     参数:
         n_embd, n_head, block_size, bias, dropout: 标准 transformer 参数
-        ffn:  可选的自定义 FFN（如 MoE_FFN），None 则用默认 MLP
+        ffn:        可选的自定义 FFN（如 MoE_FFN），None 则用默认 MLP
+        checkpoint: True = 不存中间激活值，反向时重算（省 40-50% 显存，慢 20-30%）
     """
 
     def __init__(self, n_embd: int, n_head: int, block_size: int,
                  bias: bool = True, dropout: float = 0.0,
-                 ffn: nn.Module | None = None):
+                 ffn: nn.Module | None = None, checkpoint: bool = False):
         super().__init__()
         self.ln_1 = LayerNorm(n_embd, bias=bias)
         self.attn = CausalSelfAttention(n_embd, n_head, block_size, bias, dropout)
         self.ln_2 = LayerNorm(n_embd, bias=bias)
         self.mlp = ffn if ffn is not None else MLP(n_embd, bias, dropout)
+        self.checkpoint = checkpoint
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x: torch.Tensor, kv_cache: dict | None = None):
+        if self.checkpoint and self.training and kv_cache is None:
+            # 梯度检查点: 不存 attn/mlp 内部激活值，反向时重算前向
+            from torch.utils.checkpoint import checkpoint
+            x = x + checkpoint(self._attn_block, self.ln_1(x),
+                               use_reentrant=False)
+            x = x + checkpoint(self._mlp_block, self.ln_2(x),
+                               use_reentrant=False)
+        else:
+            x = x + self.attn(self.ln_1(x), kv_cache)
+            x = x + self.mlp(self.ln_2(x))
         return x
+
+    def _attn_block(self, x):
+        return self.attn(x)
+
+    def _mlp_block(self, x):
+        return self.mlp(x)
