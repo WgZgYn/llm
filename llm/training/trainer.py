@@ -41,6 +41,8 @@ class Trainer:
         self.scaler = scaler
         self.ddp = ddp
 
+        self._train_loader = train_loader
+        self._val_loader = val_loader
         self._train_iter = iter(train_loader)
         self._val_iter = iter(val_loader)
 
@@ -275,7 +277,17 @@ class Trainer:
 
     def _fetch(self, split: str):
         it = self._train_iter if split == 'train' else self._val_iter
-        X, Y = next(it)
+        try:
+            X, Y = next(it)
+        except StopIteration:
+            # DataLoader 耗尽 → 重建迭代器（无限循环）
+            loader = self._train_loader if split == 'train' else self._val_loader
+            it = iter(loader)
+            if split == 'train':
+                self._train_iter = it
+            else:
+                self._val_iter = it
+            X, Y = next(it)
         if self.device.type == 'cuda':
             X = X.to(self.device, non_blocking=True)
             Y = Y.to(self.device, non_blocking=True)

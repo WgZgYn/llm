@@ -21,12 +21,40 @@
 
 import os
 import sys
+import mmap as _mmap_module
 import warnings
 from typing import Iterator, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+
+
+# 防止 mmap 对象被 GC 回收导致底层内存被释放
+_mmap_refs: list = []
+
+
+def _open_mmap(filepath: str) -> np.ndarray:
+    """打开 .bin 文件的 mmap，带 MADV_RANDOM 建议（读完即丢，不污染 page cache）。
+
+    MADV_RANDOM 告诉内核：我们对这个文件的访问是随机的，
+    不要预读相邻页，读完的页可以尽快回收。
+    对几十 GB 的 LM 训练数据只扫一次或不规则访问，此举大幅降低 RAM 占用量。
+    """
+    fd = os.open(filepath, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        mm = _mmap_module.mmap(fd, size, access=_mmap_module.ACCESS_READ)
+    finally:
+        os.close(fd)  # mmap 创建后可安全关闭
+
+    _mmap_refs.append(mm)
+    # Linux: 告诉内核随机访问，不要预读，读完可回收
+    if hasattr(mm, 'madvise') and hasattr(_mmap_module, 'MADV_RANDOM'):
+        mm.madvise(_mmap_module.MADV_RANDOM)
+
+    raw = np.frombuffer(mm, dtype=np.uint16)
+    return raw
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -69,10 +97,10 @@ class LMStream(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
         # ── 打开 mmap（每个 worker 独立）──
-        raw = np.memmap(self.filepath, dtype=np.uint16, mode='r')
+        raw = _open_mmap(self.filepath)  # MADV_RANDOM → 读完即丢
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*non-writable.*")
-            raw_t = torch.from_numpy(raw)  # 零拷贝 view，只读不写
+            raw_t = torch.from_numpy(raw)  # 零拷贝，只读
         total = len(raw) - self.block_size
 
         # ── 计算本 worker 的分片范围 ──
@@ -121,6 +149,7 @@ def create_dataloader(
     block_size: int,
     num_workers: int | None = None,
     prefetch_factor: int = 2,
+    method: str = "mmap",
 ) -> DataLoader:
     """创建无限循环的 DataLoader，自动处理 DDP/FSDP + worker 数据分片。
 
@@ -129,13 +158,13 @@ def create_dataloader(
         split:            'train' 或 'val'
         batch_size:       每 GPU 的 micro-batch 大小
         block_size:       GPT 的上下文窗口
-        num_workers:      DataLoader 子进程数（None=自动: Windows→0, Linux→2）
+        num_workers:      DataLoader 子进程数（None=自动）
         prefetch_factor:  每个 worker 预取的 batch 数
+        method:           'mmap' (默认) 或 'pread' (零 page cache 污染)
 
     返回:
         DataLoader，迭代器永不耗尽。X, Y 已 pin_memory。
     """
-    # Windows: 多进程 DataLoader 有 spawn 开销 + Ctrl-C 会同时杀死 worker
     if num_workers is None:
         num_workers = 0 if sys.platform == 'win32' else 2
 
@@ -143,11 +172,15 @@ def create_dataloader(
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"数据文件不存在: {filepath}")
 
-    stream = LMStream(filepath, batch_size, block_size)
+    if method == "pread":
+        from .pread_loader import PReadLMStream
+        stream = PReadLMStream(filepath, batch_size, block_size)
+    else:
+        stream = LMStream(filepath, batch_size, block_size)
 
     loader = DataLoader(
         stream,
-        batch_size=None,             # IterableDataset 自己控制 batch
+        batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,

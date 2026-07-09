@@ -114,13 +114,15 @@ def build_model(model_cfg: GPTConfig, train_cfg: TrainingConfig,
         ptdtype = {'float16': torch.float16, 'bfloat16': torch.bfloat16}[train_cfg.dtype]
         mp = MixedPrecisionPolicy(param_dtype=ptdtype, reduce_dtype=ptdtype)
 
-        raw_model = raw_model.to(device)
+        # ⚠️ 不要先 .to(device) —— 会让整份模型先上 GPU，峰值爆炸
+        # FSDP 在 fully_shard 时自动把参数搬到当前 CUDA device
+        torch.cuda.set_device(device)
         for block in raw_model.transformer.h:
             fully_shard(block, mp_policy=mp,
                         reshard_after_forward=train_cfg.fsdp_reshard)
         fully_shard(raw_model, mp_policy=mp,
                     reshard_after_forward=train_cfg.fsdp_reshard)
-        model = raw_model  # FSDP 原地包装，raw_model 和 model 是同一个对象
+        model = raw_model
 
     elif backend == "ddp" and is_dist:
         raw_model = raw_model.to(device)
@@ -131,7 +133,7 @@ def build_model(model_cfg: GPTConfig, train_cfg: TrainingConfig,
         raw_model = raw_model.to(device)
         model = raw_model
 
-    # ── step 3: torch.compile ──
+    # ── step 3: torch.compile（FSDP 分片完后再 compile，避免双倍峰值）──
     if train_cfg.compile and hasattr(torch, 'compile'):
         try:
             import triton  # noqa: F401
@@ -169,6 +171,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-strict", action="store_true")
     parser.add_argument("--compile", action="store_true", default=None,
                         dest="force_compile")
+    parser.add_argument("--loader", type=str, default="mmap",
+                        choices=["mmap", "pread"],
+                        help="数据加载方式: mmap (默认) 或 pread")
     args = parser.parse_args()
     return args
 
@@ -234,9 +239,11 @@ def main():
         sys.exit(1)
 
     train_loader = create_dataloader(
-        data_dir, "train", train_cfg.batch_size, model_cfg.block_size)
+        data_dir, "train", train_cfg.batch_size, model_cfg.block_size,
+        method=args.loader)
     val_loader = create_dataloader(
-        data_dir, "val", train_cfg.batch_size, model_cfg.block_size)
+        data_dir, "val", train_cfg.batch_size, model_cfg.block_size,
+        method=args.loader)
 
     # ── 8. Trainer ──
     trainer = Trainer(
