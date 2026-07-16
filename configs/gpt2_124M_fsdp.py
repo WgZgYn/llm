@@ -47,7 +47,8 @@ training = TrainingConfig(
     backend="fsdp",               # ← FSDP 后端
     device="cuda",
     dtype="float16",
-    compile=True,
+    compile=False,               # FSDP + torch.compile 当前存在兼容问题（PyTorch < 2.6），
+                                 # 稳定后改为 True。也可通过 python -u -X torch.compile scripts/train.py ... 手动启用。
     ddp_backend="nccl",
     fsdp_reshard=True,            # FULL_SHARD (ZeRO-3)
     wandb_log=False,

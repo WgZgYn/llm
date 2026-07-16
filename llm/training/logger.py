@@ -16,6 +16,7 @@
 
 import os
 import json
+import math
 import time
 import threading
 from datetime import datetime, timedelta
@@ -313,6 +314,7 @@ class TrainingLogger:
             "progress_pct": round(100 * iter_num / max(1, self.config.max_iters), 2),
             "loss": round(loss, 4),
             "best_val_loss": round(best_val, 4),
+            "ppl": round(math.exp(loss), 1),
             "lr": lr,
             "elapsed": str(timedelta(seconds=int(elapsed))),
             "eta": self._compute_eta(iter_num),

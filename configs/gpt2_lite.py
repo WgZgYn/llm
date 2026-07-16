@@ -23,6 +23,7 @@ model = GPTConfig(
     n_embd=384,                # 384 维
     dropout=0.0,
     bias=True,
+    gradient_checkpointing=False,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -39,9 +40,9 @@ training = TrainingConfig(
     # ═══ 关键：使用你已处理好的 OpenWebText ═══
     dataset="openwebtext",          # 对应 data/openwebtext 下的 train.bin / val.bin
     data_dir="data/openwebtext",    # 确认路径无误
-    batch_size=8,                   # 每卡 batch size
-    gradient_accumulation_steps=4,  # 有效 batch = 8*4 = 32 样本/步
-                                    # 每步 token 数 = 32 * 512 = 16,384 tokens
+    batch_size=16,                   # 每卡 batch size
+    gradient_accumulation_steps=4,  # 有效 batch = 16*4 = 64 样本/步
+                                    # 每步 token 数 = 64 * 512 = 32,768 tokens
 
     # 优化器
     learning_rate=3e-4,

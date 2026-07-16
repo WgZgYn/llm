@@ -9,6 +9,7 @@ Trainer 只负责: 拿数据 → 前向 → 反向 → 更新 → 评估 → 日
 """
 
 import os
+import math
 import time
 import torch
 import torch.nn as nn
@@ -208,7 +209,7 @@ class Trainer:
         train_loss = losses['train'].item() if isinstance(losses['train'], torch.Tensor) else losses['train']
         val_loss = losses['val'].item() if isinstance(losses['val'], torch.Tensor) else losses['val']
         print(f"step {self.iter_num}: train loss {train_loss:.4f}, "
-              f"val loss {val_loss:.4f}")
+              f"val loss {val_loss:.4f}, ppl {math.exp(val_loss):.1f}")
 
         lr = self.scheduler(self.iter_num)
         if self.logger:

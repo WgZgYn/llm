@@ -12,27 +12,33 @@ from llm.model.gpt import GPT
 from llm.config.model_config import GPTConfig
 
 
-def bench(cfg, name, prompt_len=32, n_tokens=200):
+def bench(cfg, name, prompt_len=32, n_tokens=200, device='cuda'):
     """测试有/无 KV-Cache 的逐 token 延迟。"""
-    model = GPT(cfg).cuda().eval()
-    prompt = torch.randint(0, cfg.vocab_size or 1000, (1, prompt_len), device='cuda')
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    if device == 'cuda' and not torch.cuda.is_available():
+        print(f"  [WARN] CUDA 不可用，回退到 CPU。")
+        device = 'cpu'
+    model = GPT(cfg).to(device).eval()
+    prompt = torch.randint(0, cfg.vocab_size or 1000, (1, prompt_len), device=device)
+    n_params = model.get_num_params(non_embedding=False) / 1e6
+    sync = torch.cuda.synchronize if device == 'cuda' else (lambda: None)
 
     # 预热
     for _ in range(5):
         model.generate(prompt, 10, use_cache=False)
         model.generate(prompt, 10, use_cache=True)
-    torch.cuda.synchronize()
+    sync()
 
     # ── 无 cache: 测每个 token 的延迟 ──
+    # 注意: 这里直接调用 model() 前向 + argmax（贪婪解码），
+    # 排除了 softmax/multinomial 采样开销，仅测量前向延迟。
     idx = prompt.clone()
     times_nocache = []
     for _ in range(n_tokens):
         idx_cond = idx if idx.size(1) <= cfg.block_size else idx[:, -cfg.block_size:]
-        t0 = time.time()
+        t0 = time.perf_counter()
         logits, _ = model(idx_cond)
-        torch.cuda.synchronize()
-        t1 = time.time()
+        sync()
+        t1 = time.perf_counter()
         idx = torch.cat([idx, logits[:, -1, :].argmax(dim=-1, keepdim=True)], dim=1)
         times_nocache.append((t1 - t0) * 1000)
         # 收集 40 个点即可（趋势已明显）
@@ -41,23 +47,26 @@ def bench(cfg, name, prompt_len=32, n_tokens=200):
     n_nocache = len(times_nocache)
 
     # ── KV-Cache ──
-    t0 = time.time()
+    # 注意: avg_cache 包含首 token 的 prefill (完整 prompt 的前向)，
+    # 后续 token 才享受 cache 加速。因此 avg_cache 会略微高估逐 token 延迟。
+    # speedup 使用 "最后10个无 cache token" vs "cache 平均" 以凸显长序列差距。
+    t0 = time.perf_counter()
     model.generate(prompt, n_nocache, use_cache=True)
-    torch.cuda.synchronize()
-    t_total_cache = time.time() - t0
+    sync()
+    t_total_cache = time.perf_counter() - t0
     avg_cache = (t_total_cache / n_nocache) * 1000
 
     # ── 打印 ──
-    avg_no_first = sum(times_nocache) / n_nocache
+    avg_all = sum(times_nocache) / n_nocache
     avg_no_last10 = sum(times_nocache[-10:]) / 10
     print(f"\n{name}  ({n_params:.1f}M params, {cfg.n_layer}L {cfg.n_head}H {cfg.n_embd}D)")
     print(f"  序列从 {prompt_len} → {prompt_len + n_nocache} tokens")
-    print(f"  无 cache:  avg={avg_no_first:5.1f}ms/token  "
+    print(f"  无 cache:  avg={avg_all:5.1f}ms/token  "
           f"最后10个={avg_no_last10:5.1f}ms/token")
-    print(f"  KV-Cache:  avg={avg_cache:5.1f}ms/token")
+    print(f"  KV-Cache:  avg={avg_cache:5.1f}ms/token (含 prefill)")
     speedup = avg_no_last10 / avg_cache if avg_cache > 0 else 0
-    print(f"  加速比 (最后10 token vs cache): {speedup:.1f}x")
-    print(f"  首 token 延迟 (无cache): {times_nocache[0]:.1f}ms  (cache): {avg_cache:.1f}ms")
+    print(f"  加速比 (最后10 token vs cache avg): {speedup:.1f}x")
+    print(f"  首 token 延迟 (无cache): {times_nocache[0]:.1f}ms")
 
 
 if __name__ == "__main__":
@@ -86,15 +95,16 @@ if __name__ == "__main__":
                     n_embd=192, dropout=0.0, bias=True)
     model = GPT(cfg).eval()
     prompt = torch.randint(0, 1000, (1, 16))
-    print(f"  ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
+    n_p = model.get_num_params(non_embedding=False) / 1e6
+    print(f"  ({n_p:.1f}M params)")
 
     for N in [20, 50, 100]:
-        t0 = time.time()
+        t0 = time.perf_counter()
         model.generate(prompt, N, use_cache=False)
-        t_nocache = time.time() - t0
-        t0 = time.time()
+        t_nocache = time.perf_counter() - t0
+        t0 = time.perf_counter()
         model.generate(prompt, N, use_cache=True)
-        t_cache = time.time() - t0
+        t_cache = time.perf_counter() - t0
         print(f"  生成 {N:>3d} tokens:  no-cache={t_nocache*1000:6.0f}ms  "
               f"cache={t_cache*1000:6.0f}ms  speedup={t_nocache/t_cache:.1f}x")
 
@@ -104,21 +114,28 @@ if __name__ == "__main__":
                      n_embd=128, dropout=0.0, bias=True)
     model2 = GPT(cfg2).eval()
     T = cfg2.block_size
+    # 注意: 直接设置内部属性是脆弱的 —— 依赖 CausalSelfAttention 的实现细节。
+    # 若 attention 实现变更（重命名 flash/移除 bias），此段可能静默失效。
     for block in model2.transformer.h:
-        block.attn.flash = False
+        try:
+            block.attn.flash = False
+        except AttributeError:
+            print("  [WARN] 无法禁用 Flash Attention（attn 结构已变更），跳过此测试。")
+            break
         if not hasattr(block.attn, 'bias'):
             mask = torch.tril(torch.ones(T, T))
             block.attn.register_buffer('bias', mask.view(1, 1, T, T))
-    n_p = sum(p.numel() for p in model2.parameters()) / 1e6
-    prompt2 = torch.randint(0, 1000, (1, 8))
-    print(f"  ({n_p:.1f}M params, Flash Attn OFF, O(n^2) attention)")
+    else:
+        n_p = model2.get_num_params(non_embedding=False) / 1e6
+        prompt2 = torch.randint(0, 1000, (1, 8))
+        print(f"  ({n_p:.1f}M params, Flash Attn OFF, O(n^2) attention)")
 
-    for N in [20, 50, 100]:
-        t0 = time.time()
-        model2.generate(prompt2, N, use_cache=False)
-        t_nocache = time.time() - t0
-        t0 = time.time()
-        model2.generate(prompt2, N, use_cache=True)
-        t_cache = time.time() - t0
-        print(f"  生成 {N:>3d} tokens:  no-cache={t_nocache*1000:6.0f}ms  "
-              f"cache={t_cache*1000:6.0f}ms  speedup={t_nocache/t_cache:.1f}x")
+        for N in [20, 50, 100]:
+            t0 = time.perf_counter()
+            model2.generate(prompt2, N, use_cache=False)
+            t_nocache = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            model2.generate(prompt2, N, use_cache=True)
+            t_cache = time.perf_counter() - t0
+            print(f"  生成 {N:>3d} tokens:  no-cache={t_nocache*1000:6.0f}ms  "
+                  f"cache={t_cache*1000:6.0f}ms  speedup={t_nocache/t_cache:.1f}x")
