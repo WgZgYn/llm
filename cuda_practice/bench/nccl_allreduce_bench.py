@@ -1,165 +1,696 @@
-# nccl_allreduce_bench.py —— NCCL 集合通信原语基准（多机/多卡）
+# nccl_collective_bench.py
 #
-# 用 PyTorch 的 NCCL 后端测各种集合通信原语的"消息大小 vs 耗时/带宽"关系。
-# 只支持 Linux + 多 GPU（NCCL 不支持 Windows；单进程单卡也跑不了集合通信）。
+# PyTorch + NCCL collective communication microbenchmark
 #
-# 运行（单机多卡 / 多机）：
-#   torchrun --nproc_per_node=8 --nnodes=2 --node_rank=<0/1> \
-#            --master_addr=<ip> --master_port=29500 \
-#            nccl_allreduce_bench.py --op allreduce --max-size 1G
+# 目标：
+#   测量不同 message size 下：
+#     - total latency
+#     - estimated fixed latency
+#     - estimated transfer time
+#     - payload bandwidth
+#     - NCCL-style bus bandwidth
 #
-# 输出：终端表格 + 可选 CSV（--output） + 可选带宽-大小曲线图（--plot）。
+# 运行：
+#
+#   torchrun --nproc-per-node 4 \
+#       nccl_collective_bench.py \
+#       --op allreduce
+#
+#   torchrun --nproc-per-node 2 \
+#       nccl_collective_bench.py \
+#       --op allreduce
+#
+# 输出：
+#   size
+#   total latency
+#   transfer time
+#   fixed latency
+#   payload bandwidth
+#   bus bandwidth
+#   efficiency
+
 import argparse
+import math
 import os
-import time
+import statistics
 
 import torch
 import torch.distributed as dist
 
-# 支持的集合通信原语
-OPS = ["allreduce", "broadcast", "reduce", "allgather", "reduce_scatter", "all_to_all"]
+
+OPS = [
+    "allreduce",
+    "broadcast",
+    "reduce",
+    "allgather",
+    "reduce_scatter",
+    "all_to_all",
+]
 
 
 def human_bytes(n):
+    n = float(n)
+
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if n < 1024 or unit == "TB":
             return f"{n:.2f} {unit}"
         n /= 1024
 
 
-def busbw_factor(op, n):
-    """NCCL 的 bus bandwidth 系数：数据实际穿过总线的是 S 的多少倍。
+def parse_size(s):
+    s = s.strip().upper()
 
-    对应"总传输量"与单卡消息量 S 的关系：
-      - allreduce / reduce_scatter / all_to_all: 2*(n-1)/n * S
-      - allgather: (n-1)/n * S
-      - broadcast / reduce: S（单卡视角，无 n 相关缩放）
+    units = {
+        "K": 1024,
+        "M": 1024 ** 2,
+        "G": 1024 ** 3,
+    }
+
+    if s[-1] in units:
+        return int(float(s[:-1]) * units[s[-1]])
+
+    return int(s)
+
+
+def busbw_factor(op, world_size):
     """
+    NCCL-style bus bandwidth factor.
+
+    S = input message size per rank.
+
+    AllReduce:
+        2 * (N-1) / N
+
+    ReduceScatter:
+        2 * (N-1) / N
+
+    AllToAll:
+        2 * (N-1) / N
+
+    AllGather:
+        (N-1) / N
+
+    Broadcast / Reduce:
+        1
+    """
+
+    n = world_size
+
     if op in ("allreduce", "reduce_scatter", "all_to_all"):
         return 2 * (n - 1) / n
+
     if op == "allgather":
         return (n - 1) / n
+
     return 1.0
 
 
-def run_collective(op, tensor, out_list, world_size, rank):
-    """执行一次集合通信。tensor 是每个 rank 的输入，out_list 是 gather 类输出。"""
+def run_collective(op, tensor, world_size):
+
     if op == "allreduce":
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+        dist.all_reduce(
+            tensor,
+            op=dist.ReduceOp.SUM,
+        )
+
     elif op == "broadcast":
-        dist.broadcast(tensor, src=0)
+
+        dist.broadcast(
+            tensor,
+            src=0,
+        )
+
     elif op == "reduce":
-        dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+
+        dist.reduce(
+            tensor,
+            dst=0,
+            op=dist.ReduceOp.SUM,
+        )
+
     elif op == "allgather":
-        dist.all_gather(out_list, tensor)
+
+        outputs = [
+            torch.empty_like(tensor)
+            for _ in range(world_size)
+        ]
+
+        dist.all_gather(
+            outputs,
+            tensor,
+        )
+
     elif op == "reduce_scatter":
-        # 输入切成 world_size 块，各块求和后 scatter 回各 rank
-        chunks = list(tensor.chunk(world_size))
-        out = torch.empty_like(chunks[0])
-        dist.reduce_scatter(out, chunks, op=dist.ReduceOp.SUM)
+
+        chunks = list(
+            tensor.chunk(world_size)
+        )
+
+        output = torch.empty_like(chunks[0])
+
+        dist.reduce_scatter(
+            output,
+            chunks,
+            op=dist.ReduceOp.SUM,
+        )
+
     elif op == "all_to_all":
-        chunks_in = list(tensor.chunk(world_size))
-        chunks_out = [torch.empty_like(c) for c in chunks_in]
-        dist.all_to_all(chunks_out, chunks_in)
+
+        chunks_in = list(
+            tensor.chunk(world_size)
+        )
+
+        chunks_out = [
+            torch.empty_like(c)
+            for c in chunks_in
+        ]
+
+        dist.all_to_all(
+            chunks_out,
+            chunks_in,
+        )
+
     else:
         raise ValueError(op)
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--op", choices=OPS, default="allreduce")
-    p.add_argument("--min-size", default="1K", help="起始消息大小（每卡），如 1K")
-    p.add_argument("--max-size", default="1G", help="最大消息大小（每卡）")
-    p.add_argument("--steps", type=int, default=10, help="对数扫点的步数")
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--iters", type=int, default=20)
-    p.add_argument("--output", default="", help="输出 CSV 路径")
-    p.add_argument("--plot", action="store_true", help="画带宽-大小曲线")
-    args = p.parse_args()
+def make_sizes(min_b, max_b, steps):
 
-    dist.init_process_group(backend="nccl")
+    lo = math.log2(min_b)
+    hi = math.log2(max_b)
+
+    sizes = []
+
+    for i in range(steps):
+
+        x = lo + (hi - lo) * i / (steps - 1)
+
+        sizes.append(
+            int(2 ** x)
+        )
+
+    return sorted(set(sizes))
+
+
+def barrier():
+
+    dist.barrier()
+
+    # Make sure previous CUDA work is finished.
+    torch.cuda.synchronize()
+
+
+def measure(op, tensor, world_size, warmup, iters):
+
+    # --------------------------------------------------
+    # Warmup
+    # --------------------------------------------------
+
+    for _ in range(warmup):
+        run_collective(
+            op,
+            tensor,
+            world_size,
+        )
+
+    barrier()
+
+    # --------------------------------------------------
+    # Measure
+    # --------------------------------------------------
+
+    start = torch.cuda.Event(
+        enable_timing=True
+    )
+
+    end = torch.cuda.Event(
+        enable_timing=True
+    )
+
+    start.record()
+
+    for _ in range(iters):
+
+        run_collective(
+            op,
+            tensor,
+            world_size,
+        )
+
+    end.record()
+
+    torch.cuda.synchronize()
+
+    elapsed_ms = start.elapsed_time(end)
+
+    latency_us = (
+        elapsed_ms
+        * 1000
+        / iters
+    )
+
+    # Collect latency from all ranks.
+    latency_tensor = torch.tensor(
+        [latency_us],
+        device=tensor.device,
+        dtype=torch.float64,
+    )
+
+    gathered = [
+        torch.empty_like(latency_tensor)
+        for _ in range(world_size)
+    ]
+
+    dist.all_gather(
+        gathered,
+        latency_tensor,
+    )
+
+    rank_times = [
+        x.item()
+        for x in gathered
+    ]
+
+    return {
+        "local": latency_us,
+        "min": min(rank_times),
+        "mean": statistics.mean(rank_times),
+        "median": statistics.median(rank_times),
+        "max": max(rank_times),
+    }
+
+
+def linear_fit(sizes, times_us):
+    """
+    Fit:
+
+        T = alpha + beta * S
+
+    where:
+
+        alpha = fixed latency
+        beta  = seconds / byte
+
+    Returns:
+
+        alpha_us
+        bandwidth_GBps
+    """
+
+    xs = [
+        float(x)
+        for x in sizes
+    ]
+
+    ys = [
+        float(y)
+        for y in times_us
+    ]
+
+    x_mean = statistics.mean(xs)
+    y_mean = statistics.mean(ys)
+
+    numerator = sum(
+        (x - x_mean) * (y - y_mean)
+        for x, y in zip(xs, ys)
+    )
+
+    denominator = sum(
+        (x - x_mean) ** 2
+        for x in xs
+    )
+
+    if denominator == 0:
+        return 0.0, 0.0
+
+    beta = numerator / denominator
+
+    alpha = y_mean - beta * x_mean
+
+    # beta = us / byte
+    #
+    # bandwidth:
+    #
+    # byte / us
+    # = byte / second * 1e-6
+    #
+    # GB/s = byte/s / 1e9
+    #
+    # therefore:
+    # GB/s = 1 / beta / 1e3
+
+    bandwidth_gbps = (
+        1.0 / beta / 1000
+        if beta > 0
+        else 0.0
+    )
+
+    return alpha, bandwidth_gbps
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--op",
+        choices=OPS,
+        default="allreduce",
+    )
+
+    parser.add_argument(
+        "--min-size",
+        default="1K",
+    )
+
+    parser.add_argument(
+        "--max-size",
+        default="1G",
+    )
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--output",
+        default="",
+    )
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------
+    # Init distributed
+    # --------------------------------------------------
+
+    dist.init_process_group(
+        backend="nccl"
+    )
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    dev = torch.device("cuda", local_rank)
+
+    local_rank = int(
+        os.environ.get(
+            "LOCAL_RANK",
+            0,
+        )
+    )
+
+    torch.cuda.set_device(
+        local_rank
+    )
+
+    device = torch.device(
+        "cuda",
+        local_rank,
+    )
+
+    # --------------------------------------------------
+    # Sizes
+    # --------------------------------------------------
+
+    min_b = parse_size(
+        args.min_size
+    )
+
+    max_b = parse_size(
+        args.max_size
+    )
+
+    sizes = make_sizes(
+        min_b,
+        max_b,
+        args.steps,
+    )
+
+    factor = busbw_factor(
+        args.op,
+        world_size,
+    )
+
+    # --------------------------------------------------
+    # Header
+    # --------------------------------------------------
 
     if rank == 0:
-        print(f"NCCL 集合通信基准  op={args.op}  world_size={world_size}")
-        print(f"消息大小按每卡计（S bytes），带宽用 NCCL bus bandwidth 口径")
-        print(f"{'size':>12}  {'latency(us)':>12}  {'busbw(GB/s)':>12}")
 
-    def parse_size(s):
-        s = s.strip().upper()
-        mult = {"K": 1024, "M": 1024**2, "G": 1024**3}
-        if s[-1] in mult:
-            return int(float(s[:-1]) * mult[s[-1]])
-        return int(s)
+        print()
+        print("=" * 105)
 
-    min_b, max_b = parse_size(args.min_size), parse_size(args.max_size)
-    # 对数扫点：从 min 到 max 取 steps 个点
-    sizes = []
-    import math
-    lo, hi = math.log2(min_b), math.log2(max_b)
-    for i in range(args.steps):
-        sizes.append(int(2 ** (lo + (hi - lo) * i / (args.steps - 1))))
-    sizes = sorted(set(sizes))
+        print(
+            f"NCCL Collective Benchmark"
+        )
 
-    factor = busbw_factor(args.op, world_size)
-    rows = []
+        print(
+            f"op={args.op} "
+            f"world_size={world_size}"
+        )
+
+        print(
+            f"message size = per-rank input size"
+        )
+
+        print(
+            f"bus bandwidth factor = {factor:.4f}"
+        )
+
+        print("=" * 105)
+
+        print(
+            f"{'Size':>12} "
+            f"{'Total(us)':>12} "
+            f"{'Transfer(us)':>14} "
+            f"{'Fixed(us)':>12} "
+            f"{'Payload(GB/s)':>15} "
+            f"{'BusBW(GB/s)':>13} "
+            f"{'Eff.(%)':>10}"
+        )
+
+        print("-" * 105)
+
+    results = []
+
+    # --------------------------------------------------
+    # Benchmark
+    # --------------------------------------------------
 
     for nbytes in sizes:
-        n_float = max(1, nbytes // 4)
-        tensor = torch.rand(n_float, device=dev)  # S bytes
-        out_list = [torch.empty_like(tensor) for _ in range(world_size)]
 
-        # warmup
-        for _ in range(args.warmup):
-            run_collective(args.op, tensor, out_list, world_size, rank)
-        torch.cuda.synchronize()
+        # float32 => 4 bytes
+        n_elements = max(
+            1,
+            nbytes // 4,
+        )
 
-        # 计时：事件包住一个循环，取平均
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(args.iters):
-            run_collective(args.op, tensor, out_list, world_size, rank)
-        end.record()
-        torch.cuda.synchronize()
-        t_us = start.elapsed_time(end) / args.iters * 1e3  # 单次，微秒
+        tensor = torch.empty(
+            n_elements,
+            device=device,
+            dtype=torch.float32,
+        )
 
-        busbw = factor * nbytes / (t_us * 1e-6) / 1e9  # GB/s
-        rows.append((nbytes, t_us, busbw))
+        # Initialize only once.
+        torch.rand_like(
+            tensor,
+            out=tensor,
+        )
+
+        result = measure(
+            args.op,
+            tensor,
+            world_size,
+            args.warmup,
+            args.iters,
+        )
+
+        # Use MAX rank time as collective time.
+        #
+        # Collective completes only when the slowest
+        # rank has completed.
+        total_us = result["max"]
+
+        # Payload bandwidth:
+        #
+        # S / T
+        payload_gbps = (
+            nbytes
+            / (total_us * 1e-6)
+            / 1e9
+        )
+
+        # NCCL-style bus bandwidth.
+        busbw_gbps = (
+            factor
+            * nbytes
+            / (total_us * 1e-6)
+            / 1e9
+        )
+
+        results.append(
+            {
+                "size": nbytes,
+                "total_us": total_us,
+                "payload_gbps": payload_gbps,
+                "busbw_gbps": busbw_gbps,
+            }
+        )
+
+        del tensor
+
+    # --------------------------------------------------
+    # Estimate fixed latency + bandwidth
+    #
+    # Only use larger messages for fitting.
+    # Small messages are heavily affected by launch/
+    # synchronization overhead.
+    # --------------------------------------------------
+
+    fit_start = max(
+        0,
+        len(results) // 2,
+    )
+
+    fit_sizes = [
+        r["size"]
+        for r in results[fit_start:]
+    ]
+
+    fit_times = [
+        r["total_us"]
+        for r in results[fit_start:]
+    ]
+
+    fixed_us, fitted_bw = linear_fit(
+        fit_sizes,
+        fit_times,
+    )
+
+    # --------------------------------------------------
+    # Print final table
+    # --------------------------------------------------
+
+    for r in results:
+
+        transfer_us = max(
+            0.0,
+            r["total_us"] - fixed_us,
+        )
+
+        payload_bw = r[
+            "payload_gbps"
+        ]
+
+        efficiency = (
+            payload_bw
+            / fitted_bw
+            * 100
+            if fitted_bw > 0
+            else 0
+        )
+
         if rank == 0:
-            print(f"{human_bytes(nbytes):>12}  {t_us:>12.2f}  {busbw:>12.2f}")
 
-    # 汇总（可选：各 rank 的最小/平均，这里简单起见 rank 0 直接输出）
+            print(
+                f"{human_bytes(r['size']):>12} "
+                f"{r['total_us']:>12.2f} "
+                f"{transfer_us:>14.2f} "
+                f"{fixed_us:>12.2f} "
+                f"{payload_bw:>15.2f} "
+                f"{r['busbw_gbps']:>13.2f} "
+                f"{efficiency:>9.1f}%"
+            )
+
+    # --------------------------------------------------
+    # Summary
+    # --------------------------------------------------
+
+    if rank == 0:
+
+        print()
+        print("=" * 70)
+
+        print(
+            f"Estimated fixed latency : "
+            f"{fixed_us:.2f} us"
+        )
+
+        print(
+            f"Estimated payload BW    : "
+            f"{fitted_bw:.2f} GB/s"
+        )
+
+        print(
+            f"NCCL bus BW factor      : "
+            f"{factor:.4f}"
+        )
+
+        print("=" * 70)
+
+    # --------------------------------------------------
+    # CSV
+    # --------------------------------------------------
+
     if args.output and rank == 0:
-        with open(args.output, "w") as f:
-            f.write("size_bytes,latency_us,busbw_gbps\n")
-            for nbytes, t_us, bw in rows:
-                f.write(f"{nbytes},{t_us:.2f},{bw:.2f}\n")
-        print(f"已保存 CSV -> {args.output}")
 
-    if args.plot and rank == 0:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            xs = [r[0] for r in rows]
-            ys = [r[2] for r in rows]
-            plt.figure()
-            plt.plot(xs, ys, "-o")
-            plt.xscale("log")
-            plt.xlabel("message size per rank (bytes)")
-            plt.ylabel("bus bandwidth (GB/s)")
-            plt.title(f"NCCL {args.op}, world_size={world_size}")
-            plt.grid(True, which="both", ls="--", alpha=0.4)
-            out = args.output.rsplit(".", 1)[0] + ".png" if args.output else f"nccl_{args.op}.png"
-            plt.savefig(out, dpi=110)
-            print(f"已保存图 -> {out}")
-        except ImportError:
-            print("未安装 matplotlib，跳过画图（pip install matplotlib 后可用 --plot）")
+        with open(
+            args.output,
+            "w",
+        ) as f:
+
+            f.write(
+                "size_bytes,"
+                "total_us,"
+                "transfer_us,"
+                "fixed_us,"
+                "payload_gbps,"
+                "busbw_gbps,"
+                "efficiency\n"
+            )
+
+            for r in results:
+
+                transfer_us = max(
+                    0.0,
+                    r["total_us"]
+                    - fixed_us,
+                )
+
+                efficiency = (
+                    r["payload_gbps"]
+                    / fitted_bw
+                    * 100
+                    if fitted_bw > 0
+                    else 0
+                )
+
+                f.write(
+                    f"{r['size']},"
+                    f"{r['total_us']:.4f},"
+                    f"{transfer_us:.4f},"
+                    f"{fixed_us:.4f},"
+                    f"{r['payload_gbps']:.4f},"
+                    f"{r['busbw_gbps']:.4f},"
+                    f"{efficiency:.2f}\n"
+                )
+
+        print(
+            f"CSV saved to {args.output}"
+        )
 
     dist.destroy_process_group()
 
