@@ -498,17 +498,12 @@ def main():
             nbytes // 4,
         )
 
-        tensor = torch.empty(
+        tensor = torch.rand(
             n_elements,
             device=device,
             dtype=torch.float32,
         )
 
-        # Initialize only once.
-        torch.rand_like(
-            tensor,
-            out=tensor,
-        )
 
         result = measure(
             args.op,
