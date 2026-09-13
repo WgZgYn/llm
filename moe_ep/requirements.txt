@@ -1,0 +1,17 @@
+# Deliberately minimal: this demo is torch + the standard library, nothing else.
+#
+# The point of the project is to understand EP from the code, so there is no
+# DeepSpeed, no Megatron, no DeepEP, no flash-attn, no transformers.  If you
+# find yourself wanting to add one, that is a signal the demo has drifted from
+# its purpose.
+#
+# Target machine: Linux, single node, 4x Tesla V100 16GB (sm_70 / Volta).
+#   - fp16 tensor cores: yes
+#   - bf16: NOT supported by the hardware
+# Install the CUDA build matching the box's driver, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+torch>=2.1
+
+# Optional, for reading the JSONL artifacts back:
+#   pandas>=2.0
