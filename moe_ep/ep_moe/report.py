@@ -20,6 +20,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+#: Phase dicts reach the writer in two shapes and both key on "mean ms":
+#: ``PhaseTimer.stats()`` produces ``ms_mean`` (one rank's local view), while
+#: ``bench_ep.cross_rank_phases()`` produces ``ms_mean_across_ranks`` (the
+#: gathered view).  Reading the wrong one used to raise KeyError in the
+#: markdown path and -- worse -- silently write empty columns in the CSV path.
+#: Both are accepted here so a phase table is never quietly blank.
+_PHASE_MS_KEYS = ("ms_mean_across_ranks", "ms_mean")
+
+
+def phase_mean_ms(phase: Any) -> Optional[float]:
+    """Mean milliseconds for a phase dict of either shape, or None."""
+    if not isinstance(phase, dict):
+        return None
+    for key in _PHASE_MS_KEYS:
+        if key in phase:
+            value = phase[key]
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
 def _jsonable(obj: Any) -> Any:
     """Best-effort conversion so a stray tensor can never break the dump."""
     if isinstance(obj, dict):
@@ -90,7 +111,7 @@ class ResultWriter:
             for k, v in r.items():
                 if k == "phases" and isinstance(v, dict):
                     for pname, pv in v.items():
-                        row[f"phase.{pname}.ms"] = pv.get("ms_mean")
+                        row[f"phase.{pname}.ms"] = phase_mean_ms(pv)
                 elif isinstance(v, (dict, list)):
                     row[k] = json.dumps(_jsonable(v))
                 else:
@@ -155,8 +176,8 @@ class ResultWriter:
                 phases = r.get("phases") or {}
                 cells = [str(r.get("tag") or r.get("label") or "?")]
                 for p in phase_names:
-                    v = phases.get(p)
-                    cells.append(f"{v['ms_mean']:.3f}" if v else "-")
+                    ms = phase_mean_ms(phases.get(p))
+                    cells.append(f"{ms:.3f}" if ms is not None else "-")
                 parts.append("| " + " | ".join(cells) + " |")
             parts.append("")
         else:
