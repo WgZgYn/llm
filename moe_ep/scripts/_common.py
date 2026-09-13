@@ -173,11 +173,13 @@ def setup_determinism(enabled: bool, seed: int) -> None:
 # ----------------------------------------------------------------------
 # output helpers
 # ----------------------------------------------------------------------
-def make_writer(args: argparse.Namespace, default_tag: str):
+def make_writer(args: argparse.Namespace, default_tag: str, is_main: bool = True):
     from ep_moe.report import ResultWriter
 
     tag = args.tag or default_tag
-    return ResultWriter(args.out, tag=tag, enabled=not args.no_write)
+    return ResultWriter(
+        args.out, tag=tag, enabled=not args.no_write, is_main=is_main
+    )
 
 
 def print_rank0(ctx, *parts) -> None:
@@ -185,7 +187,9 @@ def print_rank0(ctx, *parts) -> None:
         print(*parts, flush=True)
 
 
-def section(title: str) -> None:
+def section(title: str, enabled: bool = True) -> None:
+    if not enabled:
+        return
     print()
     print("-" * 78)
     print(title)
@@ -193,22 +197,34 @@ def section(title: str) -> None:
 
 
 class Checker:
-    """Accumulates OK/WARN/FAIL lines and decides the process exit code."""
+    """Accumulates OK/WARN/FAIL lines and decides the process exit code.
 
-    def __init__(self) -> None:
+    ``is_main=False`` keeps counting but stops printing.  Under
+    ``torchrun --nproc_per_node=4`` every rank shares one stdout, so four
+    ungated printers interleave character by character into an unreadable
+    mess -- but the *count* still has to be maintained on every rank, because
+    the exit code comes from an all-reduce of it.
+    """
+
+    def __init__(self, is_main: bool = True) -> None:
+        self.is_main = is_main
         self.failures = 0
         self.warnings = 0
 
+    def _emit(self, tag: str, label: str, detail: str) -> None:
+        if self.is_main:
+            print(f"{tag} {label}" + (f"  {detail}" if detail else ""), flush=True)
+
     def ok(self, label: str, detail: str = "") -> None:
-        print(f"[ OK ] {label}" + (f"  {detail}" if detail else ""))
+        self._emit("[ OK ]", label, detail)
 
     def warn(self, label: str, detail: str = "") -> None:
         self.warnings += 1
-        print(f"[WARN] {label}" + (f"  {detail}" if detail else ""))
+        self._emit("[WARN]", label, detail)
 
     def fail(self, label: str, detail: str = "") -> None:
         self.failures += 1
-        print(f"[FAIL] {label}" + (f"  {detail}" if detail else ""))
+        self._emit("[FAIL]", label, detail)
 
     def check(self, condition: bool, label: str, detail: str = "") -> bool:
         (self.ok if condition else self.fail)(label, detail)

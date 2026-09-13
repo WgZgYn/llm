@@ -36,13 +36,22 @@ class ResultWriter:
     """Writes the per-configuration artifacts under ``out_dir``."""
 
     def __init__(
-        self, out_dir: str | os.PathLike, tag: str = "run", enabled: bool = True
+        self,
+        out_dir: str | os.PathLike,
+        tag: str = "run",
+        enabled: bool = True,
+        is_main: bool = True,
     ) -> None:
         self.enabled = enabled
+        #: Under torchrun every rank constructs a writer, but only rank 0 may
+        #: touch the files.  Four processes appending to one JSONL interleave
+        #: at arbitrary byte offsets and corrupt it, so the guard lives here
+        #: rather than at each call site where it would eventually be forgotten.
+        self.is_main = is_main
         self.tag = tag
         self.out_dir = Path(out_dir)
         self.records: List[Dict[str, Any]] = []
-        if self.enabled:
+        if self.enabled and self.is_main:
             self.out_dir.mkdir(parents=True, exist_ok=True)
 
     # -- paths ------------------------------------------------------------
@@ -58,7 +67,7 @@ class ResultWriter:
     # -- writing ----------------------------------------------------------
     def add(self, record: Dict[str, Any]) -> None:
         self.records.append(record)
-        if not self.enabled:
+        if not self.enabled or not self.is_main:
             return
         with open(self.jsonl_path(), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(_jsonable(record), ensure_ascii=False) + "\n")
@@ -69,7 +78,7 @@ class ResultWriter:
         Keys are unioned in first-seen order; the phase dict is exploded into
         ``phase.<name>.ms`` columns so a sweep plots without extra parsing.
         """
-        if not self.enabled:
+        if not self.enabled or not self.is_main:
             return
         rows = list(self.records if rows is None else rows)
         if not rows:
@@ -110,7 +119,7 @@ class ResultWriter:
         notes: Optional[Sequence[str]] = None,
         table_columns: Optional[Sequence[str]] = None,
     ) -> Optional[Path]:
-        if not self.enabled or not self.records:
+        if not self.enabled or not self.is_main or not self.records:
             return None
 
         env = env or environment_facts()

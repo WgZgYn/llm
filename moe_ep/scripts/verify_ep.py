@@ -94,8 +94,10 @@ def diff_stats(a: torch.Tensor, b: torch.Tensor) -> dict:
 def main() -> int:
     args = parse_args()
     ctx = init_distributed()
-    chk = Checker()
-    writer = make_writer(args, default_tag=f"verify_ep{ctx.world}")
+    chk = Checker(is_main=ctx.is_main)
+    writer = make_writer(
+        args, default_tag=f"verify_ep{ctx.world}", is_main=ctx.is_main
+    )
 
     try:
         world = ctx.world
@@ -197,7 +199,8 @@ def main() -> int:
             ep_out = ep_stack(x_local)
 
         if dense_stack is None:
-            print("\n--skip-dense: skipping the numeric comparison.")
+            if ctx.is_main:
+                print("\n--skip-dense: skipping the numeric comparison.")
             records = [{"tag": args.tag or "verify", "ep_size": world,
                         "routing_match": True, "skipped_dense": True}]
         else:
@@ -287,11 +290,12 @@ def main() -> int:
     if ctx.is_main:
         writer.write_csv()
         print(f"\nartifacts: {writer.jsonl_path()}")
-    if failures:
-        print(f"\n{failures} check(s) FAILED.")
-        return 1
-    print("\ncorrectness checks passed.")
-    return 0
+    if ctx.is_main:
+        if failures:
+            print(f"\n{failures} check(s) FAILED.")
+        else:
+            print("\ncorrectness checks passed.")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -10,10 +10,18 @@ with known data *before* any MoE code runs -- if the split/transpose arithmetic
 in ``ep_moe/comm.py`` is wrong, that is where you find out, with a clear
 expected-vs-actual, rather than as a mysterious numeric difference later.
 
+Output
+------
+**Every line is printed by rank 0 only.**  With ``--nproc_per_node=4`` four
+processes share one stdout, and ungated prints interleave character by
+character into something unreadable.  Checks are still *evaluated* on every
+rank (the failure count is all-reduced), and per-rank facts are gathered and
+rendered as one table rather than four interleaved blocks.
+
 Usage::
 
     torchrun --standalone --nproc_per_node=4 scripts/check_env.py
-    torchrun --standalone --nproc_per_node=4 scripts/check_env.py --p2p-size-mb 64
+    torchrun --standalone --nproc_per_node=4 scripts/check_env.py --skip-p2p
 """
 
 from __future__ import annotations
@@ -21,6 +29,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import traceback
+from typing import List, Optional
 
 import _common  # noqa: F401  (sys.path bootstrap; must precede ep_moe)
 import torch
@@ -53,6 +63,12 @@ from ep_moe.topology import (
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     add_model_args(p)
+    p.add_argument(
+        "--ep-size",
+        type=int,
+        default=None,
+        help="assert this equals world_size; normally omitted here",
+    )
     p.add_argument("--p2p-size-mb", type=int, default=32, help="P2P ping-pong payload")
     p.add_argument("--p2p-iters", type=int, default=20)
     p.add_argument("--p2p-warmup", type=int, default=5)
@@ -63,36 +79,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-write", action="store_true")
     return p.parse_args()
 
+
+def emit(ctx, *parts) -> None:
+    """Print, but only from rank 0.  The single output gate for this script."""
+    if ctx.is_main:
+        print(*parts, flush=True)
+
+
 # ======================================================================
 def section_1_environment(chk: Checker, ctx) -> None:
-    section("1. environment")
-    print(f"  torch             {torch.__version__}")
-    print(f"  torch.version.cuda{torch.version.cuda:>6}")
-    print(f"  cudnn             {torch.backends.cudnn.version()}")
-    print(f"  nccl              {nccl_version()}")
-    print(f"  backend           {ctx.backend}")
-    print(f"  cuda available    {torch.cuda.is_available()}")
-    print(f"  device count      {torch.cuda.device_count()}")
+    section("1. environment", ctx.is_main)
+    emit(ctx, f"  torch             {torch.__version__}")
+    emit(ctx, f"  torch.version.cuda{torch.version.cuda:>6}")
+    emit(ctx, f"  cudnn             {torch.backends.cudnn.version()}")
+    emit(ctx, f"  nccl              {nccl_version()}")
+    emit(ctx, f"  backend           {ctx.backend}")
+    emit(ctx, f"  cuda available    {torch.cuda.is_available()}")
+    emit(ctx, f"  device count      {torch.cuda.device_count()}")
 
     if not dist.is_nccl_available():
         chk.fail("NCCL backend", "not available in this torch build")
     else:
         chk.ok("NCCL backend available")
 
-    print()
-    print("  relevant environment:")
+    emit(ctx)
+    emit(ctx, "  relevant environment:")
     keys = [
         "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
         "MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES",
     ]
     for k in keys:
-        print(f"    {k:<26} {os.environ.get(k, '(unset)')}")
+        emit(ctx, f"    {k:<26} {os.environ.get(k, '(unset)')}")
     nccl_vars = sorted(k for k in os.environ if k.startswith(("NCCL_", "TORCH_NCCL_")))
     if nccl_vars:
         for k in nccl_vars:
-            print(f"    {k:<26} {os.environ[k]}")
+            emit(ctx, f"    {k:<26} {os.environ[k]}")
     else:
-        print("    (no NCCL_* / TORCH_NCCL_* variables set)")
+        emit(ctx, "    (no NCCL_* / TORCH_NCCL_* variables set)")
 
     if not os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"):
         chk.warn(
@@ -101,9 +124,10 @@ def section_1_environment(chk: Checker, ctx) -> None:
             "See scripts/env.example.sh",
         )
 
+
 # ======================================================================
 def section_2_visibility(chk: Checker, ctx) -> None:
-    section("2. CUDA_VISIBLE_DEVICES consistency")
+    section("2. CUDA_VISIBLE_DEVICES consistency", ctx.is_main)
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     visible = torch.cuda.device_count()
     if cvd is None:
@@ -124,9 +148,11 @@ def section_2_visibility(chk: Checker, ctx) -> None:
                 f"{ctx.world}",
             )
 
+
 # ======================================================================
 def section_3_topology(chk: Checker, ctx, args) -> None:
-    section("3. topology invariants")
+    section("3. topology invariants", ctx.is_main)
+
     if ctx.world != torch.cuda.device_count():
         chk.warn(
             "world_size != device_count",
@@ -143,55 +169,73 @@ def section_3_topology(chk: Checker, ctx, args) -> None:
             f"({args.ep_size})",
         )
 
-    facts = gpu_facts(ctx.device)
-    print()
-    print(f"  rank {ctx.rank} on {facts['name']} (cuda:{ctx.local_rank})")
-    print(f"    compute capability  {facts['capability']}")
-    print(f"    SM count            {facts['sm_count']}")
-    print(f"    memory              {facts['total_MB']:.0f} MB total, "
-          f"{facts['free_MB']:.0f} MB free")
-    print(f"    bf16 native         {facts['bf16_native']}")
+    # Gathered so the whole node is one readable table instead of four
+    # interleaved blocks.
+    facts_all: List[Optional[dict]] = [None] * ctx.world
+    dist.all_gather_object(facts_all, gpu_facts(ctx.device))
 
-    major = int(facts["capability"].split(".")[0])
+    rows = []
+    for r, f in enumerate(facts_all):
+        rows.append(
+            [
+                str(r),
+                f["name"],
+                f["capability"],
+                str(f["sm_count"]),
+                f"{f['total_MB']:.0f}",
+                f"{f['free_MB']:.0f}",
+                "yes" if f["bf16_native"] else "no",
+            ]
+        )
+    emit(ctx)
+    emit(ctx, format_table(
+        ["rank/cuda", "device", "cap", "SMs", "total MB", "free MB", "bf16"],
+        rows,
+        title="per-rank devices  (rank r runs on cuda:r under torchrun)",
+    ))
+
+    major = int(facts_all[ctx.rank]["capability"].split(".")[0])
     if major < 8:
         chk.warn(
-            f"pre-Ampere device (sm_{facts['capability'].replace('.', '')})",
+            f"pre-Ampere device (sm_{facts_all[ctx.rank]['capability'].replace('.', '')})",
             "bf16 has no hardware path here; --dtype fp16 is the correct "
             "default and bf16 timings would be meaningless",
         )
     else:
         chk.ok("Ampere or newer", "bf16 is native")
 
-    numa = pci_topology()
+    # Host-side probes: same answer on every rank, so only rank 0 pays for them.
+    numa = pci_topology() if ctx.is_main else {}
     if numa:
-        print()
-        print("  NUMA placement (spec expects 0,1 on one socket and 2,3 on the other):")
+        emit(ctx)
+        emit(ctx, "  NUMA placement (spec expects 0,1 on one socket and 2,3 on the other):")
         for k, v in sorted(numa.items()):
-            print(f"    {k:<26} {v}")
+            emit(ctx, f"    {k:<26} {v}")
 
-    topo = nvidia_smi_topo()
+    topo = nvidia_smi_topo() if ctx.is_main else ""
     if topo:
-        print()
-        print("  nvidia-smi topo -m:")
+        emit(ctx)
+        emit(ctx, "  nvidia-smi topo -m:")
         for line in topo.rstrip().splitlines():
-            print(f"    {line}")
-    else:
+            emit(ctx, f"    {line}")
+    elif ctx.is_main:
         chk.warn("nvidia-smi topo -m unavailable", "cannot confirm the link types")
+
 
 # ======================================================================
 def section_4_p2p_access(chk: Checker, ctx) -> None:
-    section("4. P2P access matrix")
+    section("4. P2P access matrix", ctx.is_main)
     n = torch.cuda.device_count()
     local = p2p_access_matrix()
-    gathered = [None] * ctx.world
+    gathered: List[Optional[list]] = [None] * ctx.world
     dist.all_gather_object(gathered, local)
     mat = gathered[0]
 
-    print("  can_device_access_peer[i][j]  (rows: from, cols: to)")
+    emit(ctx, "  can_device_access_peer[i][j]  (rows: from, cols: to)")
     rows = []
     for i in range(n):
         rows.append([f"gpu{i}"] + ["yes" if mat[i][j] else "-" for j in range(n)])
-    print(format_table([""] + [f"gpu{j}" for j in range(n)], rows))
+    emit(ctx, format_table([""] + [f"gpu{j}" for j in range(n)], rows))
 
     if n >= 4:
         intra = [(0, 1), (1, 0), (2, 3), (3, 2)]
@@ -203,16 +247,19 @@ def section_4_p2p_access(chk: Checker, ctx) -> None:
         else:
             chk.ok("intra-group P2P available", "pairs (0,1) and (2,3)")
         ok_cross = [p for p in cross if mat[p[0]][p[1]]]
-        print(f"    cross-group pairs with P2P: {len(ok_cross)}/{len(cross)}")
+        emit(ctx, f"    cross-group pairs with P2P: {len(ok_cross)}/{len(cross)}")
+
 
 # ======================================================================
-def section_5_p2p_bandwidth(chk: Checker, ctx, args) -> None:
-    section("5. measured P2P bandwidth (one-way payload GB/s, timed on receiver)")
+def section_5_p2p_bandwidth(chk: Checker, ctx, args) -> dict:
+    section("5. measured P2P bandwidth (one-way payload GB/s, timed on receiver)",
+            ctx.is_main)
     hidden = 4096
     nrows = max(1, args.p2p_size_mb * 2**20 // (hidden * 2))
-    print(f"  payload {nrows * hidden * 2 / 2**20:.1f} MB per transfer, "
-          f"{args.p2p_iters} iters after {args.p2p_warmup} warmup")
-    print()
+    emit(ctx, f"  payload {nrows * hidden * 2 / 2**20:.1f} MB per transfer, "
+              f"{args.p2p_iters} iters after {args.p2p_warmup} warmup, "
+              f"{ctx.world * (ctx.world - 1)} directed pairs")
+    emit(ctx)
 
     mat = one_way_bandwidth_matrix(
         ctx, nrows, hidden, iters=args.p2p_iters, warmup=args.p2p_warmup
@@ -224,11 +271,11 @@ def section_5_p2p_bandwidth(chk: Checker, ctx, args) -> None:
             [f"gpu{i}"]
             + [("-" if i == j else f"{host[i][j]:.2f}") for j in range(ctx.world)]
         )
-    print(format_table([""] + [f"->gpu{j}" for j in range(ctx.world)], rows))
+    emit(ctx, format_table([""] + [f"->gpu{j}" for j in range(ctx.world)], rows))
 
     summary = summarise_matrix(mat, ctx.world)
     med = summary.get("median_GBps", 0.0)
-    print(f"\n  median one-way bandwidth: {med:.2f} GB/s")
+    emit(ctx, f"\n  median one-way bandwidth: {med:.2f} GB/s")
     cold = [
         f"{i}->{j}"
         for i in range(ctx.world)
@@ -245,9 +292,9 @@ def section_5_p2p_bandwidth(chk: Checker, ctx, args) -> None:
         mi = summary["intra_mean_GBps"]
         mc = summary["cross_mean_GBps"]
         ratio = summary.get("intra_over_cross", 0.0)
-        print(f"  intra-group (0-1, 2-3) mean : {mi:.2f} GB/s")
-        print(f"  cross-group (SYS)      mean : {mc:.2f} GB/s")
-        print(f"  ratio intra/cross           : {ratio:.2f}x")
+        emit(ctx, f"  intra-group (0-1, 2-3) mean : {mi:.2f} GB/s")
+        emit(ctx, f"  cross-group (SYS)      mean : {mc:.2f} GB/s")
+        emit(ctx, f"  ratio intra/cross           : {ratio:.2f}x")
         if ratio < 1.1:
             chk.warn(
                 "intra and cross-group bandwidth look similar",
@@ -256,15 +303,14 @@ def section_5_p2p_bandwidth(chk: Checker, ctx, args) -> None:
             )
         else:
             chk.ok("intra-group is measurably faster than cross-group")
-        print("  compare against `nvidia-smi topo -m` above to interpret this")
+        emit(ctx, "  compare against `nvidia-smi topo -m` above to interpret this")
 
-    if ctx.is_main:
-        return {"matrix_GBps": host, **summary}
-    return {}
+    return {"matrix_GBps": host, **summary} if ctx.is_main else {}
+
 
 # ======================================================================
 def section_6_alltoall_semantics(chk: Checker, ctx) -> None:
-    section("6. all_to_all_single split semantics with known data")
+    section("6. all_to_all_single split semantics with known data", ctx.is_main)
     world, rank, dev = ctx.world, ctx.rank, ctx.device
 
     # Deliberately asymmetric, different on every rank, with zeros mixed in: a
@@ -281,7 +327,13 @@ def section_6_alltoall_semantics(chk: Checker, ctx) -> None:
     for s in in_splits:
         offsets.append(offsets[-1] + s)
 
-    print(f"  rank {rank}: in_splits={in_splits} (sum={nrows})")
+    all_in: List[Optional[list]] = [None] * world
+    dist.all_gather_object(all_in, in_splits)
+    if ctx.is_main:
+        emit(ctx, "  per-rank in_splits (asymmetric on purpose):")
+        for r, s in enumerate(all_in):
+            emit(ctx, f"    rank {r}: {s}  (sum={sum(s)})")
+    emit(ctx, f"  this rank ({rank}) sends {nrows} rows")
 
     # Row r of the block destined for rank d carries rank*1000 + r, and column 1
     # is the destination tag, so both the ordering and the contents of every
@@ -298,8 +350,6 @@ def section_6_alltoall_semantics(chk: Checker, ctx) -> None:
     # Exchange the split vector, then check it against the closed form computed
     # from every rank's own vector -- self-consistent even when the zero-guard
     # above fired on some rank.
-    all_in = [None] * world
-    dist.all_gather_object(all_in, in_splits)
     expected_out = [all_in[i][rank] for i in range(world)]
 
     in_t = torch.tensor(in_splits, dtype=torch.int64, device=dev)
@@ -327,16 +377,12 @@ def section_6_alltoall_semantics(chk: Checker, ctx) -> None:
         expect_vals = torch.arange(n, dtype=torch.float64, device=dev) + src * 1000
         if not torch.equal(blk[:, 0], expect_vals):
             ok = False
-            print(
-                f"    [FAIL] block from rank {src}: expected "
-                f"{expect_vals.tolist()} got {blk[:, 0].tolist()}"
-            )
+            emit(ctx, f"    [FAIL] block from rank {src}: expected "
+                      f"{expect_vals.tolist()} got {blk[:, 0].tolist()}")
         if not bool(torch.all(blk[:, 1] == float(rank))):
             ok = False
-            print(
-                f"    [FAIL] block from rank {src}: destination tag "
-                f"{blk[:, 1].unique().tolist()} != {rank}"
-            )
+            emit(ctx, f"    [FAIL] block from rank {src}: destination tag "
+                      f"{blk[:, 1].unique().tolist()} != {rank}")
     chk.check(
         ok, "received blocks come in ascending source order with intact contents"
     )
@@ -368,9 +414,10 @@ def section_6_alltoall_semantics(chk: Checker, ctx) -> None:
     if 0 in in_splits or 0 in out_splits:
         chk.ok("zero-size split handled", "(some peer sent/received nothing)")
 
+
 # ======================================================================
 def section_7_ep_roundtrip(chk: Checker, ctx, args) -> None:
-    section("7. full EP dispatch/combine round trip with identity experts")
+    section("7. full EP dispatch/combine round trip with identity experts", ctx.is_main)
     world = ctx.world
 
     # Identity experts + softmax gate weights (which sum to 1 by construction)
@@ -418,8 +465,8 @@ def section_7_ep_roundtrip(chk: Checker, ctx, args) -> None:
     # tokens.  That exercises the recv_n == 0 path, which is the one place a
     # zero-count NCCL transfer happens.  Flag it explicitly, because if this
     # build mishandles it the failure looks exotic otherwise.
-    print("  note: the skewed case drives some ranks to recv_n == 0 -- a zero-count")
-    print("        NCCL transfer. If it failed above, that is the likely cause.")
+    emit(ctx, "  note: the skewed case drives some ranks to recv_n == 0 -- a zero-count")
+    emit(ctx, "        NCCL transfer. If it failed above, that is the likely cause.")
 
     # Expert placement: every expert initialised exactly once across the group.
     cfg = ModelConfig(
@@ -429,13 +476,13 @@ def section_7_ep_roundtrip(chk: Checker, ctx, args) -> None:
     layout = EPLayout(ctx.rank, world, cfg.num_experts, cfg.top_k)
     stack = EPMoEStack(cfg, layout, group=None, device=ctx.device).to(ctx.device)
 
-    maps = [None] * world
+    maps: List[Optional[dict]] = [None] * world
     dist.all_gather_object(maps, expert_fingerprint_map(stack.layers[0].experts))
     problems = check_expert_partition(maps, cfg.num_experts)
     chk.check(not problems, "experts tile 0..E-1 exactly once across ranks",
               "; ".join(problems) if problems else "")
 
-    fps = [None] * world
+    fps: List[Optional[str]] = [None] * world
     dist.all_gather_object(fps, router_fingerprint(stack))
     chk.check(
         len(set(fps)) == 1,
@@ -443,65 +490,92 @@ def section_7_ep_roundtrip(chk: Checker, ctx, args) -> None:
         f"fingerprints={fps}" if len(set(fps)) != 1 else f"({fps[0]})",
     )
 
+
 # ======================================================================
 def section_8_summary(chk: Checker, ctx) -> None:
-    section("8. summary")
-    print(f"  section failures : {chk.failures}")
-    print(f"  section warnings : {chk.warnings}")
-    mem = memory_report()
-    print(f"  memory (rank {ctx.rank})   allocated {mem['allocated_MB']:.0f} MB, "
-          f"reserved {mem['reserved_MB']:.0f} MB, "
-          f"device free {mem['device_free_MB']:.0f} MB")
+    section("8. summary", ctx.is_main)
+
+    mem_all: List[Optional[dict]] = [None] * ctx.world
+    dist.all_gather_object(mem_all, memory_report())
+    rows = [
+        [
+            str(r),
+            f"{m['allocated_MB']:.0f}",
+            f"{m['reserved_MB']:.0f}",
+            f"{m['max_reserved_MB']:.0f}",
+            f"{m['device_free_MB']:.0f}",
+        ]
+        for r, m in enumerate(mem_all)
+    ]
+    emit(ctx, format_table(
+        ["rank", "allocated MB", "reserved MB", "peak reserved MB", "device free MB"],
+        rows,
+        title="memory after all checks (all ranks should match)",
+    ))
+    emit(ctx)
+    emit(ctx, f"  section failures : {chk.failures}")
+    emit(ctx, f"  section warnings : {chk.warnings}")
+
+
+# ======================================================================
+def run_sections(chk: Checker, ctx, args) -> dict:
+    """Run every section; a failure in one never masks the rest."""
+    p2p_record: dict = {}
+
+    sections = [
+        ("1 environment", lambda: section_1_environment(chk, ctx)),
+        ("2 visibility", lambda: section_2_visibility(chk, ctx)),
+        ("3 topology", lambda: section_3_topology(chk, ctx, args)),
+        ("4 p2p access", lambda: section_4_p2p_access(chk, ctx)),
+    ]
+    if not args.skip_p2p:
+        sections.append(
+            ("5 p2p bandwidth",
+             lambda: p2p_record.update(section_5_p2p_bandwidth(chk, ctx, args) or {}))
+        )
+    sections += [
+        ("6 all_to_all semantics", lambda: section_6_alltoall_semantics(chk, ctx)),
+        ("7 ep roundtrip", lambda: section_7_ep_roundtrip(chk, ctx, args)),
+    ]
+
+    for name, fn in sections:
+        dist.barrier()
+        try:
+            fn()
+        except Exception as exc:
+            chk.fail(
+                f"section {name} raised",
+                f"{type(exc).__name__}: {exc}",
+            )
+            if ctx.is_main:
+                traceback.print_exc(file=sys.stdout)
+
+    dist.barrier()
+    try:
+        section_8_summary(chk, ctx)
+    except Exception as exc:
+        chk.fail("section 8 raised", f"{type(exc).__name__}: {exc}")
+
+    return p2p_record
+
 
 # ======================================================================
 def main() -> int:
     args = parse_args()
     ctx = init_distributed(timeout_minutes=args.timeout_minutes)
-    chk = Checker()
-    writer = make_writer(args, default_tag=args.tag or f"check_env{ctx.world}")
-    p2p_record: dict = {}
+    # Cheeks are counted on every rank (so the all-reduced flag is meaningful)
+    # but printed only by rank 0, or four processes shred one another's output.
+    chk = Checker(is_main=ctx.is_main)
+    writer = make_writer(
+        args, default_tag=args.tag or f"check_env{ctx.world}", is_main=ctx.is_main
+    )
 
     try:
-        if ctx.is_main:
-            print("=" * 78)
-            print("Toy MoE EP -- environment preflight")
-            print("=" * 78)
-            print(f"  world_size={ctx.world}  nproc_per_node should equal this")
-            print()
+        section("Toy MoE EP -- environment preflight", ctx.is_main)
+        emit(ctx, f"  world_size={ctx.world}  nproc_per_node should equal this")
+        emit(ctx, f"  host={environment_facts().get('host')}")
 
-        dist.barrier()
-        for fn in (
-            lambda: section_1_environment(chk, ctx),
-            lambda: section_2_visibility(chk, ctx),
-            lambda: section_3_topology(chk, ctx, args),
-            lambda: section_4_p2p_access(chk, ctx),
-        ):
-            dist.barrier()
-            try:
-                fn()
-            except Exception as exc:  # keep going; one bad section is not fatal
-                chk.fail("section raised", f"{type(exc).__name__}: {exc}")
-
-        if not args.skip_p2p:
-            dist.barrier()
-            try:
-                p2p_record = section_5_p2p_bandwidth(chk, ctx, args) or {}
-            except Exception as exc:
-                chk.fail("P2P bandwidth section raised",
-                         f"{type(exc).__name__}: {exc}")
-
-        for fn in (
-            lambda: section_6_alltoall_semantics(chk, ctx),
-            lambda: section_7_ep_roundtrip(chk, ctx, args),
-        ):
-            dist.barrier()
-            try:
-                fn()
-            except Exception as exc:
-                chk.fail("section raised", f"{type(exc).__name__}: {exc}")
-
-        dist.barrier()
-        section_8_summary(chk, ctx)
+        p2p_record = run_sections(chk, ctx, args)
 
         if ctx.is_main:
             writer.add(
@@ -510,28 +584,35 @@ def main() -> int:
                     "world_size": ctx.world,
                     "failures": chk.failures,
                     "warnings": chk.warnings,
-                    "router_fingerprint_ok": True,
                     **p2p_record,
                     **environment_facts(),
                 }
             )
 
+    except Exception:
+        # Anything that escapes the per-section guards: show it on rank 0 with a
+        # real traceback rather than dying silently mid-collective.
+        if ctx.is_main:
+            print("\n!! check_env.py crashed outside a section guard:", flush=True)
+            traceback.print_exc(file=sys.stdout)
+        raise
     finally:
         total = torch.tensor([chk.failures], dtype=torch.int32, device=ctx.device)
         dist.all_reduce(total, op=dist.ReduceOp.MAX)
         failures = int(total.item())
         shutdown()
 
-    if ctx.is_main and writer.enabled:
-        writer.write_csv()
-        print(f"\nartifacts written to {writer.out_dir}/")
+    if ctx.is_main:
+        if writer.enabled:
+            writer.write_csv()
+            print(f"\nartifacts written to {writer.out_dir}/")
+        if failures:
+            print(f"\n{failures} check(s) FAILED -- do not trust benchmark numbers "
+                  f"until these are resolved.")
+        else:
+            print("\nall checks passed.")
+    return 1 if failures else 0
 
-    if failures:
-        print(f"\n{failures} check(s) FAILED -- do not trust benchmark numbers "
-              f"until these are resolved.")
-        return 1
-    print("\nall checks passed.")
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

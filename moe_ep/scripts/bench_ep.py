@@ -398,7 +398,9 @@ def main() -> int:
     if args.decode_ladder:
         args.mode = "decode"
     ctx = init_distributed()
-    writer = make_writer(args, default_tag=args.tag or f"bench_ep{ctx.world}")
+    writer = make_writer(
+        args, default_tag=args.tag or f"bench_ep{ctx.world}", is_main=ctx.is_main
+    )
 
     try:
         cfg = build_model_config(args)

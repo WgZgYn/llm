@@ -76,6 +76,11 @@ PRESET=wide OUT=out/wide bash scripts/run_all.sh
 正常，一旦路由倾斜就变成静默的数据错位。`check_env.py` §6 专门用非均匀 split 把这个问题
 在几秒钟内暴露成一行 expected-vs-actual。
 
+**输出约定：所有脚本都只由 rank 0 打印。** 4 个进程共用同一个 stdout，不加约束的话四份
+输出会按字符交错、完全没法读。检查在**每个 rank 上都会执行**（失败计数要 all-reduce 出
+退出码），每个 rank 的事实会被 gather 成一张表；产物文件也只有 rank 0 写（4 个进程同时
+append 同一个 JSONL 会写坏）。
+
 **为什么建议先 `source scripts/env.example.sh`：** 其中
 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` 把"split 不匹配导致挂死 30 分钟"变成"3 分钟后给出
 指名到 rank 的 Python traceback"。在一台你只能 ssh 上去的机器上，这个差别很大。

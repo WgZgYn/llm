@@ -58,7 +58,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     ctx = init_distributed()
-    writer = make_writer(args, default_tag=args.tag or "bench_topology")
+    writer = make_writer(
+        args, default_tag=args.tag or "bench_topology", is_main=ctx.is_main
+    )
 
     try:
         if ctx.is_main:
